@@ -104,9 +104,43 @@ validated
 
 ## Future Real Codex Provider Boundary
 
-If a real Codex-backed provider is approved, the OpenAI SDK must be used only
-inside a backend adapter/provider implementation. Frontend code, SlowTask,
-Router, Tool Executor, reducers, and replay must not call the provider directly.
+There are three separate provider paths. Do not mix their credentials or
+architecture boundaries.
+
+### Path 1: deterministic fake provider
+
+Use this by default for the slow-system Workbench demo. It requires no API key,
+does not call a model, and keeps the demo reproducible.
+
+### Path 2: local Codex Pro account via Codex CLI or Codex SDK
+
+Use this only for local developer demos after explicit mentor approval. It uses
+the local Codex authentication session created by:
+
+```bash
+codex login
+```
+
+The Codex Pro / ChatGPT login can run local Codex CLI workflows, but it is not a
+Platform API key and should not be treated as a backend service credential.
+Never copy `~/.codex/auth.json` into this repository or expose it to a frontend.
+
+If implemented, this path must still live behind a backend proposal provider and
+must run in a constrained local mode, for example:
+
+```bash
+codex exec --sandbox read-only --ephemeral --json "Return proposal JSON only."
+```
+
+The provider must parse only the final proposal JSON and must pass
+`validate_workbench_codex_proposal()` before the frontend can display it.
+
+### Path 3: OpenAI Platform API key via OpenAI SDK
+
+Use this only if a real API key is approved for the project. The OpenAI SDK must
+be used only inside a backend adapter/provider implementation. Frontend code,
+SlowTask, Router, Tool Executor, reducers, and replay must not call the provider
+directly.
 
 Runtime credentials must stay local:
 
