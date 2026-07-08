@@ -102,7 +102,7 @@ Expected status:
 validated
 ```
 
-## Future Real Codex Provider Boundary
+## Codex Provider Boundary
 
 There are three separate provider paths. Do not mix their credentials or
 architecture boundaries.
@@ -112,10 +112,12 @@ architecture boundaries.
 Use this by default for the slow-system Workbench demo. It requires no API key,
 does not call a model, and keeps the demo reproducible.
 
-### Path 2: local Codex Pro account via Codex CLI or Codex SDK
+### Path 2: local Codex Pro account via Codex CLI
 
-Use this only for local developer demos after explicit mentor approval. It uses
-the local Codex authentication session created by:
+Use this only for local developer demos after explicit mentor approval. It is
+implemented as `provider_mode="codex_cli_local"` and requires explicit opt-in
+with `allow_local_codex_cli=True`. It uses the local Codex authentication
+session created by:
 
 ```bash
 codex login
@@ -125,15 +127,43 @@ The Codex Pro / ChatGPT login can run local Codex CLI workflows, but it is not a
 Platform API key and should not be treated as a backend service credential.
 Never copy `~/.codex/auth.json` into this repository or expose it to a frontend.
 
-If implemented, this path must still live behind a backend proposal provider and
-must run in a constrained local mode, for example:
+The provider lives behind the backend proposal bridge and runs in constrained
+local mode:
 
 ```bash
-codex exec --sandbox read-only --ephemeral --json "Return proposal JSON only."
+codex exec --sandbox read-only --ephemeral --color never
 ```
 
 The provider must parse only the final proposal JSON and must pass
 `validate_workbench_codex_proposal()` before the frontend can display it.
+
+Minimal local call:
+
+```bash
+PYTHONPATH=src .venv/bin/python - <<'PY'
+from voice_agent.runtime.slow_system_workbench_codex import request_codex_proposal
+
+snapshot = {
+    "task": {
+        "evidence": [
+            {"evidence_id": "evidence://demo/asr/request"}
+        ]
+    }
+}
+
+proposal = request_codex_proposal(
+    snapshot=snapshot,
+    intent="demo request",
+    proposal_type="evidence_review",
+    source_evidence_refs=("evidence://demo/asr/request",),
+    provider_mode="codex_cli_local",
+    allow_local_codex_cli=True,
+)
+
+print(proposal["status"])
+print(proposal["summary"])
+PY
+```
 
 ### Path 3: OpenAI Platform API key via OpenAI SDK
 

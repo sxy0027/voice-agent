@@ -8,8 +8,11 @@ from voice_agent.runtime.slow_system_workbench_codex import (
     CodexProposalBridge,
     CodexProposalError,
     CodexProposalRequest,
+    CodexCliRunResult,
     FakeCodexProposalProvider,
+    LocalCodexCliProposalProvider,
     UnavailableCodexProposalProvider,
+    build_workbench_codex_proposal_capability,
     mark_codex_proposal_status,
     request_codex_proposal,
     validate_codex_proposal,
@@ -78,6 +81,128 @@ def test_bridge_fail_closes_invalid_provider_output() -> None:
     assert proposal["status"] == "rejected"
     assert "forbidden proposal field" in proposal["risk_notes"][0]
     assert all(value is False for value in proposal["safety"].values())
+
+
+def test_local_codex_cli_provider_returns_validated_proposal_from_json_output() -> None:
+    captured: dict[str, object] = {}
+
+    def runner(command: object, prompt: str, timeout_seconds: int) -> CodexCliRunResult:
+        captured["command"] = tuple(command)
+        captured["prompt"] = prompt
+        captured["timeout_seconds"] = timeout_seconds
+        return CodexCliRunResult(
+            returncode=0,
+            stdout=f"status line before json\n{json.dumps(_valid_draft())}\n",
+            stderr="",
+        )
+
+    bridge = CodexProposalBridge(
+        LocalCodexCliProposalProvider(timeout_seconds=7, runner=runner)
+    )
+
+    proposal = bridge.request_proposal(
+        CodexProposalRequest(
+            snapshot=_snapshot(),
+            intent="request a local codex cli proposal",
+            proposal_type="plan_update",
+            source_evidence_refs=("evidence://demo/user-patch/change-time",),
+        )
+    )
+
+    assert proposal["status"] == "validated"
+    assert proposal["proposal_type"] == "plan_update"
+    assert captured["command"] == (
+        "codex",
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--ephemeral",
+        "--color",
+        "never",
+    )
+    assert captured["timeout_seconds"] == 7
+    assert "Return exactly one JSON object" in str(captured["prompt"])
+    assert "PLAN_VERSION_ADVANCED" in str(captured["prompt"])
+    assert "evidence://demo/user-patch/change-time" in str(captured["prompt"])
+
+
+def test_local_codex_cli_provider_fails_closed_when_not_enabled() -> None:
+    proposal = request_codex_proposal(
+        snapshot=_snapshot(),
+        intent="request local codex cli without opt in",
+        proposal_type="plan_update",
+        source_evidence_refs=("evidence://demo/user-patch/change-time",),
+        provider_mode="codex_cli_local",
+    )
+
+    assert proposal["status"] == "rejected"
+    assert "allow_local_codex_cli=True" in proposal["risk_notes"][0]
+    assert all(value is False for value in proposal["safety"].values())
+
+
+def test_local_codex_cli_provider_hides_unsafe_stderr() -> None:
+    def runner(command: object, prompt: str, timeout_seconds: int) -> CodexCliRunResult:
+        return CodexCliRunResult(
+            returncode=1,
+            stdout="",
+            stderr="Bearer unsafe-token in /Users/local/path",
+        )
+
+    bridge = CodexProposalBridge(LocalCodexCliProposalProvider(runner=runner))
+
+    proposal = bridge.request_proposal(
+        CodexProposalRequest(
+            snapshot=_snapshot(),
+            intent="request a local codex cli proposal",
+            proposal_type="plan_update",
+            source_evidence_refs=("evidence://demo/user-patch/change-time",),
+        )
+    )
+
+    rendered = json.dumps(proposal, sort_keys=True)
+    assert proposal["status"] == "rejected"
+    assert proposal["risk_notes"] == ["Local Codex CLI proposal run failed"]
+    assert "Bearer" not in rendered
+    assert "/Users/" not in rendered
+
+
+def test_local_codex_cli_provider_rejects_non_json_output() -> None:
+    def runner(command: object, prompt: str, timeout_seconds: int) -> CodexCliRunResult:
+        return CodexCliRunResult(returncode=0, stdout="not json", stderr="")
+
+    bridge = CodexProposalBridge(LocalCodexCliProposalProvider(runner=runner))
+
+    proposal = bridge.request_proposal(
+        CodexProposalRequest(
+            snapshot=_snapshot(),
+            intent="request a local codex cli proposal",
+            proposal_type="plan_update",
+            source_evidence_refs=("evidence://demo/user-patch/change-time",),
+        )
+    )
+
+    assert proposal["status"] == "rejected"
+    assert "did not return a JSON proposal" in proposal["risk_notes"][0]
+
+
+def test_capability_matrix_marks_fake_local_and_unavailable_modes() -> None:
+    fake = build_workbench_codex_proposal_capability(provider_mode="fake")
+    local = build_workbench_codex_proposal_capability(
+        provider_mode="codex_cli_local",
+        allow_local_codex_cli=True,
+    )
+    unavailable = build_workbench_codex_proposal_capability(
+        provider_mode="codex_cli_unavailable",
+    )
+
+    assert fake["output_mode"] == "mock"
+    assert fake["mocked"] is True
+    assert fake["supports_structured_json"] is True
+    assert local["output_mode"] == "real"
+    assert local["provider"] == "codex_cli"
+    assert local["endpoint"] == "local://codex-cli"
+    assert unavailable["output_mode"] == "degraded"
+    assert unavailable["health_status"] == "unavailable"
 
 
 @pytest.mark.parametrize(
