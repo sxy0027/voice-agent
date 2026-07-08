@@ -11,6 +11,9 @@ audio/raw/
 # Python bytecode cache
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
 
 # OS-local metadata
 .DS_Store
