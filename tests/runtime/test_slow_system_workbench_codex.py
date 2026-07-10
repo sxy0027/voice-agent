@@ -122,6 +122,8 @@ def test_local_codex_cli_provider_returns_validated_proposal_from_json_output() 
     )
     assert captured["timeout_seconds"] == 7
     assert "Return exactly one JSON object" in str(captured["prompt"])
+    assert "All human-readable text fields must be written in Simplified Chinese" in str(captured["prompt"])
+    assert "旧结果, 过期证据, and 不会推进当前计划" in str(captured["prompt"])
     assert "PLAN_VERSION_ADVANCED" in str(captured["prompt"])
     assert "evidence://demo/user-patch/change-time" in str(captured["prompt"])
 

@@ -1,0 +1,160 @@
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import App from "./App";
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+describe("App", () => {
+  it("renders the interactive mocklist with Router and SlowTask ownership", () => {
+    render(<App />);
+
+    expect(screen.getByLabelText("输入 mocklist 里的用户/工具消息")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "1 新任务" })).toBeTruthy();
+    expect(screen.queryByText("SPAWN_SLOW_TASK")).toBeNull();
+    expect(screen.getAllByText("not_run").length).toBeGreaterThan(0);
+    expect(screen.getByText("No SlowTask facts yet")).toBeTruthy();
+    expect(screen.getByText("Request backend proposal")).toBeTruthy();
+    expect(screen.getByText("No Codex result yet")).toBeTruthy();
+    expect((screen.getByLabelText("Provider") as HTMLSelectElement).value).toBe(
+      "codex_cli_local",
+    );
+    expect((screen.getByLabelText("explicit local Codex CLI opt-in") as HTMLInputElement).checked).toBe(
+      true,
+    );
+  });
+
+  it("matches a material patch input, shows plan_version=2, and calls the proposal bridge", async () => {
+    const { fetchMock, resolve } = stubDeferredProposalFetch();
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText("输入 mocklist 里的用户/工具消息"), {
+      target: { value: "改成明天上午，并且预算控制在 500 元以内。" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run Router + Codex analysis" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("PATCH_ACTIVE_SLOW_TASK")).toBeNull();
+    expect(screen.queryByText("plan_version=2")).toBeNull();
+    expect(screen.getByText("No SlowTask facts yet")).toBeTruthy();
+    expect(screen.getByText("正在通过后端 bridge 调用 Codex，返回前不会显示分析结果。")).toBeTruthy();
+
+    resolve();
+    await waitFor(() => expect(screen.getAllByText("PATCH_ACTIVE_SLOW_TASK").length).toBeGreaterThan(0));
+    expect(screen.getAllByText("ACTIVE_TASK_PATCH").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/current_plan_version/i).length).toBeGreaterThan(0);
+    expect(screen.getByText("plan_version=2")).toBeTruthy();
+    expect(screen.getAllByText(/USER_PATCH_RECEIVED/).length).toBeGreaterThan(0);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/workbench/codex-proposal");
+    const requestInit = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const payload = JSON.parse(String(requestInit.body)) as {
+      provider_mode: string;
+      allow_local_codex_cli: boolean;
+    };
+    expect(payload.provider_mode).toBe("codex_cli_local");
+    expect(payload.allow_local_codex_cli).toBe(true);
+    await waitFor(() => expect(screen.getAllByText("python_codex_cli_local").length).toBeGreaterThan(0));
+  });
+
+  it("only shows stale evidence and confirmation-gate facts after running the selected scenario", async () => {
+    const fetchMock = stubProposalFetch();
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "3 旧结果" }));
+    expect(screen.getByText("No SlowTask facts yet")).toBeTruthy();
+    expect(screen.queryByText(/Stale evidence bucket/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run Router + Codex analysis" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/Stale evidence bucket/)).toBeTruthy());
+    expect(screen.getByText(/TOOL_RESULT_MARKED_STALE/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "4 确认" }));
+    expect(screen.getByText("No SlowTask facts yet")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run Router + Codex analysis" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getAllByText("CANCEL_OR_PAUSE_CANDIDATE").length).toBeGreaterThan(0));
+    expect(screen.getByText(/Pending confirmation/)).toBeTruthy();
+    expect(screen.getAllByText(/WAITING_FOR_USER_CONFIRMATION/).length).toBeGreaterThan(0);
+  });
+
+  it("builds a dynamic runtime snapshot for non-mocklist input before requesting Codex analysis", async () => {
+    const fetchMock = stubProposalFetch();
+    render(<App />);
+
+    const customInput = "请评估一个没有写进清单的准备事项。";
+    fireEvent.change(screen.getByLabelText("输入 mocklist 里的用户/工具消息"), {
+      target: { value: customInput },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run Router + Codex analysis" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getAllByText("dynamic_router").length).toBeGreaterThan(0));
+
+    const requestInit = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const payload = JSON.parse(String(requestInit.body)) as {
+      intent: string;
+      snapshot: { task: { evidence: Array<{ summary: string }> } };
+    };
+    expect(payload.intent).toBe(customInput);
+    expect(payload.snapshot.task.evidence[0].summary).toContain(customInput);
+  });
+});
+
+function buildProposalResponse() {
+  return {
+    ok: true,
+    json: async () => ({
+      backend: "python_slow_system_workbench_codex",
+      capability: {
+        output_mode: "real",
+        provider: "codex_cli",
+        health_status: "available",
+      },
+      proposal: {
+        proposal_id: "proposal_test_validated",
+        proposal_type: "plan_update",
+        status: "validated",
+        summary: "Codex bridge test proposal.",
+        suggested_next_steps: ["Review runtime input evidence."],
+        missing_fields: [],
+        requires_confirmation: false,
+        risk_notes: ["Proposal only."],
+        source_evidence_refs: ["evidence://runtime/test/user_input"],
+        safety: {
+          codex_is_fact_owner: false,
+          advances_plan_version: false,
+          authorizes_tool: false,
+          contains_secret: false,
+          mutates_task_snapshot: false,
+          emits_canonical_event: false,
+          executes_external_tool: false,
+          contains_raw_provider_body: false,
+        },
+      },
+    }),
+  };
+}
+
+function stubProposalFetch() {
+  const fetchMock = vi.fn(async (_input: string, _init?: RequestInit) => buildProposalResponse());
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+function stubDeferredProposalFetch() {
+  let resolveResponse!: () => void;
+  const responseGate = new Promise<void>((resolve) => {
+    resolveResponse = resolve;
+  });
+  const fetchMock = vi.fn(async (_input: string, _init?: RequestInit) => {
+    await responseGate;
+    return buildProposalResponse();
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return { fetchMock, resolve: resolveResponse };
+}

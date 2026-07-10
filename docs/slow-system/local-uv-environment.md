@@ -11,9 +11,11 @@ The environment is for local development only. It installs:
 - pytest for the repository test entrypoint
 - OpenAI Python SDK for future adapter-internal Codex-backed proposal work
 
-The current committed Codex proposal bridge does not call a real external model
-by default. It uses a deterministic fake provider unless a future approved
-adapter-internal provider is implemented.
+The Python proposal bridge itself defaults to the deterministic fake provider
+when no provider mode is supplied. The Week 1 React Workbench currently sends
+`provider_mode="codex_cli_local"` with explicit local opt-in by default, and
+keeps the deterministic fake provider available from the UI as a manual
+fallback for reproducible demos.
 
 ## Create The Environment
 
@@ -109,15 +111,18 @@ architecture boundaries.
 
 ### Path 1: deterministic fake provider
 
-Use this by default for the slow-system Workbench demo. It requires no API key,
-does not call a model, and keeps the demo reproducible.
+Use this for reproducible backend tests and demos that should not depend on a
+local Codex CLI login. It requires no API key, does not call a model, and keeps
+the demo deterministic. In the React Workbench this path is available through
+the `Python fake provider (manual fallback)` dropdown option.
 
 ### Path 2: local Codex Pro account via Codex CLI
 
-Use this only for local developer demos after explicit mentor approval. It is
-implemented as `provider_mode="codex_cli_local"` and requires explicit opt-in
-with `allow_local_codex_cli=True`. It uses the local Codex authentication
-session created by:
+Use this only for local developer demos after explicit mentor approval. This is
+the current Week 1 React Workbench default selection, but it still requires
+explicit opt-in in every request. It is implemented as
+`provider_mode="codex_cli_local"` with `allow_local_codex_cli=True`, and uses
+the local Codex authentication session created by:
 
 ```bash
 codex login

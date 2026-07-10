@@ -494,6 +494,11 @@ def _build_codex_cli_prompt(request: WorkbenchCodexProposalRequest) -> str:
     return (
         "You are a backend proposal generator for the voice-agent slow-system Workbench.\n"
         "Return exactly one JSON object and no markdown, prose, code fences, or tool calls.\n"
+        "All human-readable text fields must be written in Simplified Chinese: "
+        "summary, suggested_next_steps, risk_notes, and any clarification text. "
+        "Keep JSON keys, enum values, boolean values, identifiers, and source_evidence_refs unchanged. "
+        "When discussing stale evidence or old tool results, explain them in Chinese using terms such as "
+        "旧结果, 过期证据, and 不会推进当前计划.\n"
         "The JSON object must satisfy this contract:\n"
         "- proposal_id: safe string identifier\n"
         "- proposal_type: one of plan_update, evidence_review, tool_preview, clarification, commitment_draft\n"
