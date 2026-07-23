@@ -23,7 +23,11 @@ export function StatusSidebar({
 }: StatusSidebarProps) {
   const staleCount = hasRun ? runScenario.staleEvidence.length : 0;
   const hasConfirmation = hasRun && Boolean(runScenario.slowTask.pendingConfirmation);
-  const codexStatus = loading ? "calling" : proposal?.status ?? "not_called";
+  const codexStatus = loading
+    ? runScenario.streaming.active
+      ? "streaming"
+      : "calling"
+    : proposal?.status ?? "not_called";
 
   return (
     <aside className="status-sidebar" aria-label="Workbench status sidebar">
@@ -89,6 +93,11 @@ export function StatusSidebar({
           label="codex_backend"
           value={proposal?.backendMode ?? "-"}
           tone={proposal ? "blue" : "neutral"}
+        />
+        <StatusRow
+          label="live_steps"
+          value={runScenario.liveProgress.length > 0 ? String(runScenario.liveProgress.length) : "-"}
+          tone={runScenario.streaming.active ? "blue" : "neutral"}
         />
         <StatusRow
           label="proposal_type"

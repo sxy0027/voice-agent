@@ -12,6 +12,8 @@ type PlanEvidencePanelProps = Readonly<{
   hasRun: boolean;
   loading: boolean;
   proposal: CodexProposal | null;
+  sessionId?: string | null;
+  onConfirm?: (accepted: boolean) => void;
 }>;
 
 const evidenceHeading: Record<EvidenceKind, string> = {
@@ -28,8 +30,11 @@ export function PlanEvidencePanel({
   hasRun,
   loading,
   proposal,
+  sessionId,
+  onConfirm,
 }: PlanEvidencePanelProps) {
   const currentEvidence = scenario.evidence.filter((item) => !item.stale);
+  const evidenceByKind = groupEvidenceByKind(currentEvidence);
 
   return (
     <section className="panel evidence-panel" aria-labelledby="evidence-heading">
@@ -53,7 +58,7 @@ export function PlanEvidencePanel({
         <strong>Codex sync</strong>
         <p>
           {loading
-            ? "正在等待 Codex bridge 返回；SlowTask snapshot 已由本次输入生成，但 Codex 状态尚未完成。"
+            ? "Codex bridge 正在执行；中央区域会实时显示阶段、工具状态和校验进度，右侧 facts 仍由 SlowTask snapshot 拥有。"
             : proposal
               ? `Codex 已返回 ${proposal.status} / ${proposal.backendMode} / ${proposal.proposalType}；下方 facts 随本次运行展示，但 proposal 仍不是 SlowTask fact。`
               : "Router / SlowTask 已运行；等待 Codex proposal 结果。"}
@@ -117,6 +122,16 @@ export function PlanEvidencePanel({
               <dd>{scenario.slowTask.pendingConfirmation.riskSummary}</dd>
             </div>
           </dl>
+          {sessionId && onConfirm ? (
+            <div className="confirmation-actions">
+              <button type="button" disabled={loading} onClick={() => onConfirm(true)}>
+                Confirm cancellation
+              </button>
+              <button type="button" disabled={loading} onClick={() => onConfirm(false)}>
+                Keep task
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
@@ -143,7 +158,16 @@ export function PlanEvidencePanel({
         ))}
       </div>
 
-      <EvidenceGroup title={evidenceHeading.authoritative} items={currentEvidence} />
+      <EvidenceGroup title={evidenceHeading.authoritative} items={evidenceByKind.authoritative} />
+      <EvidenceGroup
+        title={evidenceHeading.non_authoritative_hypothesis}
+        items={evidenceByKind.non_authoritative_hypothesis}
+      />
+      <EvidenceGroup
+        title={evidenceHeading.untrusted_web_evidence}
+        items={evidenceByKind.untrusted_web_evidence}
+      />
+      <EvidenceGroup title={evidenceHeading.codex_proposal} items={evidenceByKind.codex_proposal} />
       <EvidenceGroup title={evidenceHeading.stale_evidence} items={scenario.staleEvidence} />
         </>
       ) : null}
@@ -155,6 +179,22 @@ type EvidenceGroupProps = Readonly<{
   title: string;
   items: readonly EvidenceItem[];
 }>;
+
+function groupEvidenceByKind(items: readonly EvidenceItem[]): Record<EvidenceKind, EvidenceItem[]> {
+  return items.reduce<Record<EvidenceKind, EvidenceItem[]>>(
+    (groups, item) => {
+      groups[item.kind].push(item);
+      return groups;
+    },
+    {
+      authoritative: [],
+      non_authoritative_hypothesis: [],
+      untrusted_web_evidence: [],
+      stale_evidence: [],
+      codex_proposal: [],
+    },
+  );
+}
 
 function EvidenceGroup({ title, items }: EvidenceGroupProps) {
   if (items.length === 0) {
@@ -169,7 +209,7 @@ function EvidenceGroup({ title, items }: EvidenceGroupProps) {
           <article className={`evidence-item evidence-${item.kind}`} key={item.id}>
             <div className="evidence-title-row">
               <strong>{item.title}</strong>
-              <span>plan_version={item.planVersion}</span>
+              <span>{trustLabel(item.kind)} · plan_version={item.planVersion}</span>
             </div>
             <p>{item.body}</p>
             <small>
@@ -180,4 +220,20 @@ function EvidenceGroup({ title, items }: EvidenceGroupProps) {
       </div>
     </div>
   );
+}
+
+function trustLabel(kind: EvidenceKind) {
+  if (kind === "authoritative") {
+    return "trust=authoritative";
+  }
+  if (kind === "non_authoritative_hypothesis") {
+    return "trust=hypothesis";
+  }
+  if (kind === "untrusted_web_evidence") {
+    return "trust=untrusted_web_evidence";
+  }
+  if (kind === "codex_proposal") {
+    return "trust=codex_proposal";
+  }
+  return "trust=stale_evidence";
 }

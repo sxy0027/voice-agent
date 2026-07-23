@@ -4,6 +4,7 @@ from voice_agent.tools.manifest import ToolManifest
 
 
 MVP2_DEMO_TOOL_MANIFEST_VERSION = "2026-05-18.slice5"
+WORKBENCH_ITINERARY_MANIFEST_VERSION = "2026-07-13.workbench.v1"
 
 
 def memo_create_manifest(
@@ -217,6 +218,98 @@ def web_search_manifest() -> ToolManifest:
     )
 
 
+def company_context_lookup_manifest() -> ToolManifest:
+    return ToolManifest(
+        tool_name="demo.company_context.lookup",
+        tool_adapter_id="demo.company_context.lookup",
+        tool_manifest_version=WORKBENCH_ITINERARY_MANIFEST_VERSION,
+        tool_category="READ_ONLY_DEMO",
+        side_effect_class="READ_ONLY",
+        risk_class="LOW",
+        required_arguments=("company_name",),
+        optional_arguments=(),
+        argument_provenance_requirements=("company_name",),
+        result_type="company_context",
+        trust_level="TRUSTED_DEMO_TOOL_RESULT",
+        source_type="DEMO_SANDBOX",
+        preview_required=False,
+        confirmation_required=False,
+        ui_patch_capable=False,
+        idempotency_required=True,
+        sandbox_state_namespace="company_context",
+        capability="mock",
+    )
+
+
+def itinerary_search_manifest() -> ToolManifest:
+    return ToolManifest(
+        tool_name="demo.itinerary.search",
+        tool_adapter_id="demo.itinerary.search",
+        tool_manifest_version=WORKBENCH_ITINERARY_MANIFEST_VERSION,
+        tool_category="READ_ONLY_DEMO",
+        side_effect_class="READ_ONLY",
+        risk_class="LOW",
+        required_arguments=("company_location", "days"),
+        optional_arguments=("time_window", "budget_max"),
+        argument_provenance_requirements=("company_location", "days"),
+        result_type="itinerary_search",
+        trust_level="TRUSTED_DEMO_TOOL_RESULT",
+        source_type="DEMO_SANDBOX",
+        preview_required=True,
+        confirmation_required=False,
+        ui_patch_capable=False,
+        idempotency_required=True,
+        sandbox_state_namespace="itinerary",
+        capability="mock",
+    )
+
+
+def itinerary_cost_estimate_manifest() -> ToolManifest:
+    return ToolManifest(
+        tool_name="demo.itinerary.cost_estimate",
+        tool_adapter_id="demo.itinerary.cost_estimate",
+        tool_manifest_version=WORKBENCH_ITINERARY_MANIFEST_VERSION,
+        tool_category="READ_ONLY_DEMO",
+        side_effect_class="READ_ONLY",
+        risk_class="LOW",
+        required_arguments=("itinerary_ref", "budget_max"),
+        optional_arguments=(),
+        argument_provenance_requirements=("itinerary_ref", "budget_max"),
+        result_type="itinerary_cost_estimate",
+        trust_level="TRUSTED_DEMO_TOOL_RESULT",
+        source_type="DEMO_SANDBOX",
+        preview_required=True,
+        confirmation_required=False,
+        ui_patch_capable=False,
+        idempotency_required=True,
+        sandbox_state_namespace="itinerary",
+        capability="mock",
+    )
+
+
+def itinerary_preview_manifest() -> ToolManifest:
+    return ToolManifest(
+        tool_name="demo.itinerary.preview",
+        tool_adapter_id="demo.itinerary.preview",
+        tool_manifest_version=WORKBENCH_ITINERARY_MANIFEST_VERSION,
+        tool_category="READ_ONLY_DEMO",
+        side_effect_class="DRY_RUN",
+        risk_class="LOW",
+        required_arguments=("itinerary_ref",),
+        optional_arguments=(),
+        argument_provenance_requirements=("itinerary_ref",),
+        result_type="itinerary_preview",
+        trust_level="TRUSTED_DEMO_TOOL_RESULT",
+        source_type="DEMO_SANDBOX",
+        preview_required=True,
+        confirmation_required=False,
+        ui_patch_capable=False,
+        idempotency_required=True,
+        sandbox_state_namespace="itinerary",
+        capability="mock",
+    )
+
+
 def mvp2_demo_tool_manifests() -> tuple[ToolManifest, ...]:
     return (
         memo_create_manifest(),
@@ -228,4 +321,8 @@ def mvp2_demo_tool_manifests() -> tuple[ToolManifest, ...]:
         flashlight_set_manifest(),
         weather_manifest(),
         web_search_manifest(),
+        company_context_lookup_manifest(),
+        itinerary_search_manifest(),
+        itinerary_cost_estimate_manifest(),
+        itinerary_preview_manifest(),
     )

@@ -159,6 +159,208 @@ class MockSlowTaskRuntime:
             produced_events=tuple(produced_events),
         )
 
+    def run_planning_started(
+        self,
+        *,
+        task_id: str,
+        plan_version: int,
+        caused_by_event_id: str,
+        event_id_prefix: str,
+        created_monotonic_ms: int,
+        created_wall_clock_ms: int,
+        start_task_event_seq: int,
+        from_state: str = "CREATED",
+        planning_reason: str = "initial_goal_accepted",
+    ) -> MockSlowTaskRunResult:
+        """Enter PLANNING without completing the task.
+
+        The original MVP-1 helper only emitted a planning-to-commitment happy
+        path.  Workbench sessions need the same canonical events while keeping
+        the task open for a tool phase and later UserPatch.
+        """
+
+        planning_started = self._append_slowtask_event(
+            event_name="PLANNING_STARTED",
+            event_id=f"{event_id_prefix}_planning_started",
+            caused_by_event_id=caused_by_event_id,
+            created_monotonic_ms=created_monotonic_ms,
+            created_wall_clock_ms=created_wall_clock_ms,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=start_task_event_seq,
+            planning_reason=planning_reason,
+        )
+        state_changed = self._append_slowtask_event(
+            event_name="SLOWTASK_STATE_CHANGED",
+            event_id=f"{event_id_prefix}_state_planning",
+            caused_by_event_id=str(planning_started["event_id"]),
+            created_monotonic_ms=created_monotonic_ms + 1,
+            created_wall_clock_ms=created_wall_clock_ms + 1,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=start_task_event_seq + 1,
+            from_state=from_state,
+            to_state="PLANNING",
+            reason=planning_reason,
+        )
+        return MockSlowTaskRunResult(
+            task_id=task_id,
+            plan_version=plan_version,
+            produced_events=(planning_started, state_changed),
+        )
+
+    def emit_waiting_for_tool(
+        self,
+        *,
+        task_id: str,
+        plan_version: int,
+        caused_by_event_id: str,
+        event_id_prefix: str,
+        created_monotonic_ms: int,
+        created_wall_clock_ms: int,
+        start_task_event_seq: int,
+        tool_call_id: str,
+        from_state: str = "PLANNING",
+    ) -> MockSlowTaskRunResult:
+        waiting = self._append_slowtask_event(
+            event_name="WAITING_FOR_TOOL",
+            event_id=f"{event_id_prefix}_waiting_for_tool",
+            caused_by_event_id=caused_by_event_id,
+            created_monotonic_ms=created_monotonic_ms,
+            created_wall_clock_ms=created_wall_clock_ms,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=start_task_event_seq,
+            tool_call_id=tool_call_id,
+        )
+        state_changed = self._append_slowtask_event(
+            event_name="SLOWTASK_STATE_CHANGED",
+            event_id=f"{event_id_prefix}_state_executing",
+            caused_by_event_id=str(waiting["event_id"]),
+            created_monotonic_ms=created_monotonic_ms + 1,
+            created_wall_clock_ms=created_wall_clock_ms + 1,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=start_task_event_seq + 1,
+            from_state=from_state,
+            to_state="EXECUTING",
+            reason="waiting_for_demo_tool_result",
+        )
+        return MockSlowTaskRunResult(
+            task_id=task_id,
+            plan_version=plan_version,
+            produced_events=(waiting, state_changed),
+        )
+
+    def mark_tool_result_stale(
+        self,
+        *,
+        task_id: str,
+        current_plan_version: int,
+        result_plan_version: int,
+        tool_call_id: str,
+        caused_by_event_id: str,
+        event_id_prefix: str,
+        created_monotonic_ms: int,
+        created_wall_clock_ms: int,
+        start_task_event_seq: int,
+        stale_evidence_ref: str,
+        stale_reason: str,
+    ) -> MockSlowTaskRunResult:
+        if result_plan_version >= current_plan_version:
+            raise ValueError("mark_tool_result_stale requires an older result_plan_version")
+        marked = self._append_slowtask_event(
+            event_name="TOOL_RESULT_MARKED_STALE",
+            event_id=f"{event_id_prefix}_tool_result_marked_stale",
+            caused_by_event_id=caused_by_event_id,
+            created_monotonic_ms=created_monotonic_ms,
+            created_wall_clock_ms=created_wall_clock_ms,
+            task_id=task_id,
+            plan_version=current_plan_version,
+            task_event_seq=start_task_event_seq,
+            tool_call_id=tool_call_id,
+            result_plan_version=result_plan_version,
+            current_plan_version=current_plan_version,
+            stale_reason=stale_reason,
+        )
+        recorded = self._append_slowtask_event(
+            event_name="STALE_EVIDENCE_RECORDED",
+            event_id=f"{event_id_prefix}_stale_evidence_recorded",
+            caused_by_event_id=str(marked["event_id"]),
+            created_monotonic_ms=created_monotonic_ms + 1,
+            created_wall_clock_ms=created_wall_clock_ms + 1,
+            task_id=task_id,
+            plan_version=current_plan_version,
+            task_event_seq=start_task_event_seq + 1,
+            stale_evidence_ref=stale_evidence_ref,
+            source_tool_result_event_id=caused_by_event_id,
+        )
+        return MockSlowTaskRunResult(
+            task_id=task_id,
+            plan_version=current_plan_version,
+            produced_events=(marked, recorded),
+        )
+
+    def finalize_current_task(
+        self,
+        *,
+        task_id: str,
+        plan_version: int,
+        current_lifecycle_state: str,
+        caused_by_event_id: str,
+        event_id_prefix: str,
+        created_monotonic_ms: int,
+        created_wall_clock_ms: int,
+        start_task_event_seq: int,
+        commitment_id: str,
+        commitment_ref: str | None = None,
+    ) -> MockSlowTaskRunResult:
+        commitment_fields: dict[str, Any] = {}
+        if commitment_ref is not None:
+            commitment_fields["commitment_ref"] = commitment_ref
+        finalizing = self._append_slowtask_event(
+            event_name="FINALIZING",
+            event_id=f"{event_id_prefix}_finalizing",
+            caused_by_event_id=caused_by_event_id,
+            created_monotonic_ms=created_monotonic_ms,
+            created_wall_clock_ms=created_wall_clock_ms,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=start_task_event_seq,
+            source_events=[caused_by_event_id],
+        )
+        commitment = self._append_slowtask_event(
+            event_name="SEMANTIC_COMMITMENT_EMITTED",
+            event_id=f"{event_id_prefix}_semantic_commitment",
+            caused_by_event_id=str(finalizing["event_id"]),
+            created_monotonic_ms=created_monotonic_ms + 1,
+            created_wall_clock_ms=created_wall_clock_ms + 1,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=start_task_event_seq + 1,
+            commitment_id=commitment_id,
+            source_events=[str(finalizing["event_id"])],
+            **commitment_fields,
+        )
+        completed = self._append_slowtask_event(
+            event_name="SLOWTASK_STATE_CHANGED",
+            event_id=f"{event_id_prefix}_state_completed",
+            caused_by_event_id=str(commitment["event_id"]),
+            created_monotonic_ms=created_monotonic_ms + 2,
+            created_wall_clock_ms=created_wall_clock_ms + 2,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=start_task_event_seq + 2,
+            from_state=current_lifecycle_state,
+            to_state="COMPLETED",
+            reason="workbench_current_plan_finalized",
+        )
+        return MockSlowTaskRunResult(
+            task_id=task_id,
+            plan_version=plan_version,
+            produced_events=(finalizing, commitment, completed),
+        )
+
     def run_planning_completed(
         self,
         *,

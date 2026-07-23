@@ -106,6 +106,34 @@ const event = (
   ...options,
 });
 
+const progress = (
+  sequence: number,
+  kind: string,
+  phase: string,
+  label: string,
+  detail: string,
+  toolName?: string,
+) => ({
+  trace_id: "trace_demo_reception_yunnan",
+  sequence,
+  kind,
+  status: "completed",
+  provider_mode: "codex_cli_local",
+  output_mode: "mock",
+  canonical: false as const,
+  task_id: "slowtask_reception_meal_001",
+  plan_version: phase.includes("v3") ? 3 : phase.includes("v2") ? 2 : 1,
+  created_monotonic_ms: sequence * 320,
+  tool_name: toolName ?? null,
+  proposal_only: true,
+  result_present: kind.includes("completed") || kind.includes("structured"),
+  usage: null,
+  latency_ms: sequence * 180,
+  detail,
+  phase,
+  label,
+});
+
 type BuildScenarioInput = Readonly<{
   id: string;
   title: string;
@@ -129,6 +157,8 @@ type BuildScenarioInput = Readonly<{
   proposalType: ProposalType;
   answer: string;
   pendingConfirmation?: SlowSystemScenario["slowTask"]["pendingConfirmation"];
+  liveProgress?: SlowSystemScenario["liveProgress"];
+  streaming?: SlowSystemScenario["streaming"];
 }>;
 
 const buildScenario = (input: BuildScenarioInput): SlowSystemScenario => ({
@@ -176,6 +206,14 @@ const buildScenario = (input: BuildScenarioInput): SlowSystemScenario => ({
     processingSummary: input.answer,
   },
   timeline: input.timeline,
+  liveProgress: input.liveProgress ?? [],
+  streaming: input.streaming ?? {
+    active: false,
+    phase: "idle",
+    label: "等待新的 Workbench turn",
+    detail: "",
+    sequence: 0,
+  },
   evidence: input.evidence,
   staleEvidence: input.staleEvidence ?? [],
   codexProposal: input.codexProposal,
@@ -184,6 +222,482 @@ const buildScenario = (input: BuildScenarioInput): SlowSystemScenario => ({
 });
 
 export const slowSystemScenarios: readonly SlowSystemScenario[] = [
+  buildScenario({
+    id: "demo_00_reception_yunnan_lunch",
+    title: "主线：云南菜接待规划启动",
+    shortName: "接待午饭",
+    demoAction: "start_new_task",
+    mockInput: "请帮忙规划一个接待午饭，选云南菜。",
+    matchKeywords: ["接待午饭", "云南菜", "接待", "午饭"],
+    summary:
+      "用户启动接待用餐规划；SlowTask 先记录云南菜偏好与午饭目标，再发现人数、地点、预算、忌口、时间窗口缺失。",
+    routerDecision: "SPAWN_SLOW_TASK",
+    taskFocus: "NEW_TASK_CANDIDATE",
+    routerRule:
+      "ADR-006：无 active SlowTask 时，复杂规划请求触发 SPAWN_SLOW_TASK；缺失字段由 SlowTask 审查 evidence 后提出。",
+    activeTaskContext: "当前没有 active SlowTask；新建 slowtask_reception_meal_001。",
+    lifecycleState: "WAITING_FOR_SLOT",
+    currentPlanVersion: 1,
+    currentTaskEventSeq: 8,
+    planVersions: [
+      {
+        planVersion: 1,
+        status: "current",
+        summary: "接待用餐规划：云南菜、午饭；缺少人数、地点、预算、忌口和精确时间。",
+        reason: "initial_plan",
+        createdByEventId: "evt_reception_v1_planning_started",
+      },
+    ],
+    evidence: [
+      evidence(
+        "demo_00_user_goal",
+        "用户目标",
+        "用户请求规划接待午饭，并明确菜系为云南菜。",
+        1,
+        "evidence://reception-yunnan/turn/start",
+      ),
+      evidence(
+        "demo_00_memory_write",
+        "Session memory write",
+        "记忆槽写入：meal_type=lunch, cuisine=Yunnan, purpose=reception。该 memory 只在本 session 内作为 evidence 使用。",
+        1,
+        "memory://session/reception_meal/preferences/v1",
+      ),
+      evidence(
+        "demo_00_missing_slots",
+        "缺失字段审查",
+        "SlowTask 判断还缺少 guest_count、location_anchor、budget、dietary_constraints、time_window。",
+        1,
+        "evidence://reception-yunnan/missing-fields/v1",
+        "non_authoritative_hypothesis",
+      ),
+    ],
+    timeline: [
+      event(1, "TURN_INGRESS_COMMITTED", "用户启动接待午饭规划。", [
+        "输入通过 turn ingress 进入 Event Journal。",
+      ], { owner: "event_journal" }),
+      event(2, "ROUTER_DECISION_EMITTED", "Router 输出 SPAWN_SLOW_TASK。", [
+        "Router 只做分类，不解释缺失字段。",
+      ], {
+        owner: "router",
+        routerDecision: "SPAWN_SLOW_TASK",
+        taskFocus: "NEW_TASK_CANDIDATE",
+      }),
+      event(3, "SLOWTASK_CREATED", "SlowTask 创建接待规划任务。", [
+        "task_id=slowtask_reception_meal_001。",
+      ], { planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(1) }),
+      event(4, "SLOWTASK_STATE_CHANGED", "SlowTask 进入 PLANNING。", [
+        "state: CREATED -> PLANNING。",
+      ], { planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(2) }),
+      event(5, "PLANNING_STARTED", "开始审查接待用餐约束。", [
+        "云南菜和午饭是 authoritative evidence。",
+      ], { planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(3) }),
+      event(6, "EVIDENCE_REVIEWED", "写入 session memory 并识别缺失槽。", [
+        "memory evidence 不包含 PII 或 secret。",
+        "缺少人数、地点、预算、忌口、时间窗口。",
+      ], { planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(4) }),
+      event(7, "INSUFFICIENT_EVIDENCE_FOR_ACTION", "证据不足，不能直接输出最终规划。", [
+        "不得把 proposal 说成最终安排。",
+      ], { planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(5) }),
+      event(8, "CLARIFICATION_REQUESTED", "请求用户补充接待数据。", [
+        "补充字段会作为 UserPatch evidence 进入下一版计划。",
+      ], { planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(6) }),
+      event(9, "WAITING_FOR_SLOT", "等待用户补充缺失字段。", [
+        "状态进入 WAITING_FOR_SLOT。",
+      ], { planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(7) }),
+      event(10, "SLOWTASK_STATE_CHANGED", "SlowTask 状态更新为 WAITING_FOR_SLOT。", [
+        "每个 SlowTask state transition 都有 journal event。",
+      ], { planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(8) }),
+    ],
+    liveProgress: [
+      progress(1, "turn.started", "planning_v1", "Codex proposal bridge 收到接待午饭任务", "只生成 proposal，不推进 SlowTask fact。"),
+      progress(2, "item.started", "planning_v1", "分析缺失字段", "检查人数、地点、预算、忌口、时间窗口是否足够。", "codex_gap_analyzer"),
+      progress(3, "item.completed", "planning_v1", "缺失字段分析完成", "返回 missing_fields proposal，等待 SlowTask/用户补充。", "codex_gap_analyzer"),
+      progress(4, "structured_output_emitted", "planning_v1", "结构化 proposal 已校验", "安全标志显示 Codex 未授权工具、未修改 plan_version。"),
+    ],
+    codexProposal: proposal(
+      "proposal_reception_yunnan_v1",
+      "clarification",
+      "Codex 建议先追问人数、地点锚点、预算、忌口和可用时间；它只提供分析草案，不拥有任务事实。",
+      ["evidence://reception-yunnan/turn/start", "memory://session/reception_meal/preferences/v1"],
+      ["保留云南菜和接待午饭目标。", "请求用户补充人数、预算、地点、忌口和时间窗口。", "等待 UserPatch 后再推进 plan_version。"],
+    ),
+    proposalType: "clarification",
+    answer:
+      "我会先记录：接待用餐、云南菜、午饭。现在还缺人数、地点锚点、预算、忌口和具体时间窗口，所以 SlowTask 进入 WAITING_FOR_SLOT；Codex 只展示缺槽分析和追问建议。",
+  }),
+  buildScenario({
+    id: "demo_06_reception_yunnan_details",
+    title: "主线：用户补充接待数据",
+    shortName: "补接待数据",
+    demoAction: "send_user_patch",
+    mockInput: "8个人，客户住在公司附近，人均200以内，有两位不吃辣，最好12点半。",
+    matchKeywords: ["8个人", "人均200", "不吃辣", "12点半", "公司附近"],
+    summary:
+      "用户补齐关键接待数据；SlowTask 将补充内容作为 UserPatch evidence，推进到 plan_version=2 并准备 demo tool 查询。",
+    routerDecision: "PATCH_ACTIVE_SLOW_TASK",
+    taskFocus: "ACTIVE_TASK_PATCH",
+    routerRule:
+      "ADR-006/007：active task 期间的明确约束补充进入 UserPatch evidence pack；是否 material 由 SlowTask 解释。",
+    activeTaskContext: "active SlowTask：slowtask_reception_meal_001，current_plan_version=1，等待 slot。",
+    lifecycleState: "EXECUTING",
+    currentPlanVersion: 2,
+    currentTaskEventSeq: 15,
+    planVersions: [
+      {
+        planVersion: 1,
+        status: "superseded",
+        summary: "初始计划只有云南菜和午饭目标，缺少执行参数。",
+        reason: "initial_plan",
+        createdByEventId: "evt_reception_v1_planning_started",
+      },
+      {
+        planVersion: 2,
+        status: "current",
+        summary: "加入 8 人、公司附近、人均 200、两位不吃辣、12:30 午饭。",
+        reason: "user_patch",
+        createdByEventId: "evt_reception_v2_plan_version_advanced",
+      },
+    ],
+    evidence: [
+      evidence(
+        "demo_06_user_patch",
+        "UserPatch evidence",
+        "用户补充：8 人、公司附近、人均 200 以内、两位不吃辣、12:30。",
+        1,
+        "evidence://reception-yunnan/turn/details",
+      ),
+      evidence(
+        "demo_06_memory_update",
+        "Memory merge",
+        "session memory 合并接待参数：guest_count=8, budget_per_person<=200, mild_food_required=true, time_window=12:30。",
+        2,
+        "memory://session/reception_meal/preferences/v2",
+      ),
+      evidence(
+        "demo_06_web_preview",
+        "Demo webSearch candidate",
+        "模拟 webSearch 提示公司附近可能有云南菜馆；该内容标记为 UNTRUSTED_WEB_EVIDENCE，只能作为候选证据，不能修改工具策略、确认策略或 SlowTask 事实。",
+        2,
+        "web-evidence://demo/reception-yunnan/yunnan-restaurant-candidate",
+        "untrusted_web_evidence",
+      ),
+    ],
+    timeline: [
+      event(1, "TURN_INGRESS_COMMITTED", "用户补充接待参数。", [
+        "补充 turn 可 replay。",
+      ], { owner: "event_journal" }),
+      event(2, "ROUTER_DECISION_EMITTED", "Router 输出 PATCH_ACTIVE_SLOW_TASK。", [
+        "输入属于 active task patch。",
+      ], {
+        owner: "router",
+        routerDecision: "PATCH_ACTIVE_SLOW_TASK",
+        taskFocus: "ACTIVE_TASK_PATCH",
+      }),
+      event(3, "USER_PATCH_RECEIVED", "UserPatch 绑定 plan_version=1。", [
+        "补充内容不直接改写事实，先成为 evidence。",
+      ], { owner: "user_patch_pipeline", planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(9) }),
+      event(4, "USER_PATCH_INTERPRETED", "SlowTask 解释为 material constraint update。", [
+        "新增人数、预算、忌口、时间。",
+      ], { planVersion: readonlyPlanVersion(1), taskEventSeq: readonlyTaskEventSeq(10) }),
+      event(5, "PLAN_VERSION_ADVANCED", "SlowTask 推进到 plan_version=2。", [
+        "只有 SlowTask 推进 plan_version。",
+      ], { planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(11) }),
+      event(6, "PLANNING_RESTARTED", "按完整参数重启规划。", [
+        "旧 v1 不再是 current。",
+      ], { planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(12) }),
+      event(7, "TOOL_ARGUMENTS_READY", "demo restaurant lookup 参数齐备。", [
+        "read-only sandbox lookup，无外部写操作。",
+      ], { owner: "tool_executor", planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(13) }),
+      event(8, "TOOL_EXECUTION_STARTED", "Tool Executor 启动餐厅候选查询。", [
+        "tool=reception_restaurant_lookup_demo。",
+      ], { owner: "tool_executor", planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(14) }),
+      event(9, "WAITING_FOR_TOOL", "等待 demo lookup 返回候选。", [
+        "进度反馈只能表达正在等待，不能说已定好。",
+      ], { planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(15) }),
+      event(10, "SLOWTASK_STATE_CHANGED", "SlowTask 状态进入 EXECUTING。", [
+        "state: PLANNING -> EXECUTING。",
+      ], { planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(15) }),
+    ],
+    liveProgress: [
+      progress(1, "item.started", "planning_v2", "解释用户补充信息", "把用户补充作为 UserPatch evidence，而不是直接覆盖计划。", "user_patch_interpreter"),
+      progress(2, "item.completed", "planning_v2", "UserPatch 解释完成", "判定为 material constraint update。", "user_patch_interpreter"),
+      progress(3, "item.started", "planning_v2", "准备餐厅查询参数", "参数绑定 task_id、plan_version 和 task_event_seq。", "tool_argument_builder"),
+      progress(4, "item.started", "planning_v2", "调用 demo restaurant lookup", "只运行 demo sandbox read-only 查询。", "reception_restaurant_lookup_demo"),
+      progress(5, "item.completed", "planning_v2", "等待餐厅候选返回", "当前还不能表达最终规划完成。", "reception_restaurant_lookup_demo"),
+    ],
+    codexProposal: proposal(
+      "proposal_reception_yunnan_v2",
+      "tool_preview",
+      "Codex 建议用补齐的参数生成 demo lookup 预览，并提醒两位不吃辣会影响云南菜点单策略。",
+      ["evidence://reception-yunnan/turn/details", "memory://session/reception_meal/preferences/v2"],
+      ["按 8 人和人均 200 过滤候选。", "为不吃辣客人保留清淡菜品备选。", "工具结果返回前不要输出最终安排。"],
+    ),
+    proposalType: "tool_preview",
+    answer:
+      "收到补充信息后，SlowTask 将它作为 UserPatch 解释为 material change，并推进到 plan_version=2。现在 demo Tool Executor 可以用这些参数做只读候选查询；进度里会展示工具名和状态。",
+  }),
+  buildScenario({
+    id: "demo_07_reception_yunnan_evening",
+    title: "主线：中途改到晚上",
+    shortName: "改晚上",
+    demoAction: "send_user_patch",
+    mockInput: "中间我插一句，把时间修改到晚上吧。",
+    matchKeywords: ["修改到晚上", "改到晚上", "晚上吧", "时间修改"],
+    summary:
+      "用户在工具查询中插入改期；SlowTask 推进到 plan_version=3，旧午饭 lookup 结果必须进入 stale evidence。",
+    routerDecision: "PATCH_ACTIVE_SLOW_TASK",
+    taskFocus: "ACTIVE_TASK_PATCH",
+    routerRule:
+      "ADR-004/016：material UserPatch 会推进 plan_version；旧 plan_version 的 ToolResult 返回后默认 stale。",
+    activeTaskContext: "active SlowTask 正在执行 plan_version=2 的午饭候选查询。",
+    lifecycleState: "PLANNING",
+    currentPlanVersion: 3,
+    currentTaskEventSeq: 22,
+    planVersions: [
+      {
+        planVersion: 2,
+        status: "superseded",
+        summary: "午饭 12:30 查询已被晚餐改期 supersede。",
+        reason: "user_patch",
+        createdByEventId: "evt_reception_v2_plan_version_advanced",
+      },
+      {
+        planVersion: 3,
+        status: "current",
+        summary: "接待用餐改为晚上；保留云南菜、8 人、人均 200、两位不吃辣、公司附近。",
+        reason: "user_patch",
+        createdByEventId: "evt_reception_v3_plan_version_advanced",
+      },
+    ],
+    evidence: [
+      evidence(
+        "demo_07_user_patch",
+        "Evening UserPatch",
+        "用户将时间从午饭 12:30 改到晚上。",
+        2,
+        "evidence://reception-yunnan/turn/evening",
+      ),
+      evidence(
+        "demo_07_memory_update",
+        "Memory rebase",
+        "session memory 更新：meal_type=dinner, time_window=evening；v2 午饭时间不再是 current fact。",
+        3,
+        "memory://session/reception_meal/preferences/v3",
+      ),
+    ],
+    staleEvidence: [
+      evidence(
+        "demo_07_stale_lunch_lookup",
+        "Stale lunch lookup result",
+        "v2 午饭候选餐厅返回太晚，时间条件已不匹配 v3 晚餐计划。",
+        2,
+        "stale://reception-yunnan/tool-result/lunch-v2",
+        "stale_evidence",
+        true,
+      ),
+    ],
+    timeline: [
+      event(1, "TURN_INGRESS_COMMITTED", "用户插入改期请求。", [
+        "输入仍通过正常 turn ingress。",
+      ], { owner: "event_journal" }),
+      event(2, "USER_PATCH_RECEIVED", "改期 UserPatch 绑定 plan_version=2。", [
+        "这是 active task patch。",
+      ], { owner: "user_patch_pipeline", planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(16) }),
+      event(3, "USER_PATCH_INTERPRETED", "SlowTask 解释为 material time change。", [
+        "时间从 lunch/12:30 改到 evening。",
+      ], { planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(17) }),
+      event(4, "PLAN_VERSION_ADVANCED", "SlowTask 推进到 plan_version=3。", [
+        "v2 工具调用不能推进 v3。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(18) }),
+      event(5, "TOOL_EXECUTION_CANCEL_REQUESTED", "请求取消 v2 in-flight lookup。", [
+        "如果 adapter 不支持取消，等待结果并按 stale policy 处理。",
+      ], { owner: "tool_executor", planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(19) }),
+      event(6, "TOOL_RESULT_RECEIVED", "v2 午饭 lookup 晚到。", [
+        "结果保留原始 plan_version=2。",
+      ], { owner: "tool_executor", planVersion: readonlyPlanVersion(2), taskEventSeq: readonlyTaskEventSeq(20) }),
+      event(7, "TOOL_RESULT_MARKED_STALE", "SlowTask 标记旧结果 stale。", [
+        "不得推进 current plan_version=3。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(21) }),
+      event(8, "STALE_EVIDENCE_RECORDED", "旧午饭结果进入 stale bucket。", [
+        "除非显式 adopt/rebase，否则只作参考。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(22) }),
+      event(9, "TASK_REPLANNED", "按晚餐约束重排第二版方案。", [
+        "这是用户口中的第二版规划设计。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(22) }),
+    ],
+    liveProgress: [
+      progress(1, "item.started", "planning_v3", "收到中途改期", "正在把晚餐时间作为 UserPatch 解释。", "user_patch_interpreter"),
+      progress(2, "item.completed", "planning_v3", "推进到 plan_version=3", "v2 午饭工具结果将按 stale policy 处理。", "slowtask_replanner"),
+      progress(3, "item.started", "planning_v3", "取消或隔离旧查询", "请求取消 v2 lookup；晚到结果不会进入当前计划。", "tool_cancellation_boundary"),
+      progress(4, "item.completed", "planning_v3", "旧午饭结果已隔离", "stale evidence bucket 已记录。", "stale_evidence_guard"),
+    ],
+    codexProposal: proposal(
+      "proposal_reception_yunnan_v3",
+      "plan_update",
+      "Codex 建议重做晚餐版本，并把午饭候选标成 stale evidence，避免旧结果污染当前计划。",
+      ["evidence://reception-yunnan/turn/evening", "stale://reception-yunnan/tool-result/lunch-v2"],
+      ["把 meal_type 改为 dinner。", "保留云南菜、8 人、人均 200 和不吃辣约束。", "重跑晚餐候选查询，不复用 v2 午饭结果。"],
+    ),
+    proposalType: "plan_update",
+    answer:
+      "这是一条 material UserPatch：SlowTask 从 v2 推进到 v3，并把晚餐作为 current fact。v2 午饭查询即使返回，也只能进入 stale evidence，不能推进当前任务。",
+  }),
+  buildScenario({
+    id: "demo_08_reception_yunnan_final",
+    title: "主线：输出最终接待规划",
+    shortName: "输出规划",
+    demoAction: "send_user_patch",
+    mockInput: "信息够了，请输出最终规划。",
+    matchKeywords: ["输出最终规划", "最终规划", "信息够了", "给我方案"],
+    summary:
+      "SlowTask 在当前 plan_version=3 上完成证据审查、参数解析和最终承诺；Composer 只能实现表达，不改写事实。",
+    routerDecision: "PATCH_ACTIVE_SLOW_TASK",
+    taskFocus: "ACTIVE_TASK_PATCH",
+    routerRule:
+      "最终回答必须来自 current-plan SemanticCommitment；Composer 不得改写 immutable facts 或风险提示。",
+    activeTaskContext: "active SlowTask：slowtask_reception_meal_001，current_plan_version=3。",
+    lifecycleState: "COMPLETED",
+    currentPlanVersion: 3,
+    currentTaskEventSeq: 29,
+    planVersions: [
+      {
+        planVersion: 3,
+        status: "completed",
+        summary: "晚餐接待规划完成：公司附近云南菜、8 人、人均 200、照顾不吃辣。",
+        reason: "user_patch",
+        createdByEventId: "evt_reception_v3_plan_version_advanced",
+      },
+    ],
+    evidence: [
+      evidence(
+        "demo_08_current_memory",
+        "Current memory snapshot",
+        "current facts：云南菜、晚餐、8 人、公司附近、人均 200、两位不吃辣。",
+        3,
+        "memory://session/reception_meal/preferences/v3",
+      ),
+      evidence(
+        "demo_08_tool_result",
+        "Dinner lookup result",
+        "demo sandbox 返回晚餐候选和点单策略：清淡菜品比例、共享菜、预留包间。",
+        3,
+        "evidence://reception-yunnan/tool-result/dinner-v3",
+      ),
+    ],
+    timeline: [
+      event(1, "TOOL_RESULT_RECEIVED", "v3 晚餐候选返回。", [
+        "结果绑定 current plan_version=3。",
+      ], { owner: "tool_executor", planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(23) }),
+      event(2, "EVIDENCE_REVIEWED", "SlowTask 审查候选和 memory。", [
+        "只使用 current evidence。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(24) }),
+      event(3, "ARGUMENTS_RESOLVED", "最终参数已解析。", [
+        "resolved_arguments 不由 Composer 改写。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(25) }),
+      event(4, "FINALIZING", "进入最终整理。", [
+        "进度反馈可以说正在整理结果。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(26) }),
+      event(5, "SEMANTIC_COMMITMENT_EMITTED", "SlowTask 发出最终承诺。", [
+        "包含不可变事实、must_say_fields 和风险提示。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(27) }),
+      event(6, "SLOWTASK_STATE_CHANGED", "SlowTask 状态进入 COMPLETED。", [
+        "state: PLANNING -> COMPLETED。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(28) }),
+    ],
+    liveProgress: [
+      progress(1, "item.completed", "planning_v3", "晚餐候选已返回", "当前 plan_version=3 的工具结果可用于最终规划。", "reception_restaurant_lookup_demo"),
+      progress(2, "item.started", "planning_v3", "整理最终规划", "覆盖餐厅选择、到达时间、点单策略和风险提示。", "semantic_commitment_builder"),
+      progress(3, "structured_output_emitted", "planning_v3", "SemanticCommitment 已准备", "Composer 只负责表达，不改写事实。", "commitment_coverage_check"),
+    ],
+    codexProposal: proposal(
+      "proposal_reception_yunnan_final",
+      "commitment_draft",
+      "Codex 可起草最终回答的表达结构，但最终事实来自 SlowTask 的 SemanticCommitment。",
+      ["memory://session/reception_meal/preferences/v3", "evidence://reception-yunnan/tool-result/dinner-v3"],
+      ["推荐公司附近云南菜晚餐，并注明需二次人工确认实际订位。", "点单保留清淡菜、低辣/不辣选项。", "将预算、人群、时间和风险提示完整说出。"],
+    ),
+    proposalType: "commitment_draft",
+    answer:
+      "最终规划：按 8 人晚餐接待处理，选择公司附近云南菜，人均控制在 200 以内；点单以菌菇、汽锅鸡、清炒时蔬、低辣过桥米线/米线小份等照顾不吃辣客人，另保留两道云南特色中辣菜给可吃辣成员。建议 18:30 到店，18:20 前集合；实际订位仍需人工确认，因为 MVP demo 工具不执行真实预订。",
+  }),
+  buildScenario({
+    id: "demo_09_reception_yunnan_cancel",
+    title: "主线：最终回答前取消规划",
+    shortName: "取消规划",
+    demoAction: "request_cancel_confirmation",
+    mockInput: "在最终回答之前取消规划吧。",
+    matchKeywords: ["取消规划", "最终回答之前取消", "不要输出了", "终止这版规划"],
+    summary:
+      "用户在最终回答前明确取消；SlowTask 记录 cancel UserPatch，终止当前 plan_version，后续晚到工具结果只能 stale/debug。",
+    routerDecision: "PATCH_ACTIVE_SLOW_TASK",
+    taskFocus: "CANCEL_OR_PAUSE_CANDIDATE",
+    routerRule:
+      "ADR-016：取消语义由 SlowTask 拥有；Router 只标注 cancel candidate，不直接 terminal task。",
+    activeTaskContext: "active SlowTask：slowtask_reception_meal_001，current_plan_version=3，尚未发出最终 SemanticCommitment。",
+    lifecycleState: "CANCELLED",
+    currentPlanVersion: 3,
+    currentTaskEventSeq: 26,
+    planVersions: [
+      {
+        planVersion: 3,
+        status: "cancelled",
+        summary: "晚餐接待规划在最终回答前被用户取消，未发出最终承诺。",
+        reason: "user_patch",
+        createdByEventId: "evt_reception_cancelled",
+      },
+    ],
+    evidence: [
+      evidence(
+        "demo_09_cancel",
+        "Cancel UserPatch",
+        "用户明确要求在最终回答前取消规划。",
+        3,
+        "evidence://reception-yunnan/turn/cancel-before-final",
+      ),
+    ],
+    timeline: [
+      event(1, "TURN_INGRESS_COMMITTED", "取消请求被提交。", [
+        "取消也不能绕过 ingress。",
+      ], { owner: "event_journal" }),
+      event(2, "ROUTER_DECISION_EMITTED", "Router 标注 CANCEL_OR_PAUSE_CANDIDATE。", [
+        "Router 不直接取消 SlowTask。",
+      ], {
+        owner: "router",
+        routerDecision: "PATCH_ACTIVE_SLOW_TASK",
+        taskFocus: "CANCEL_OR_PAUSE_CANDIDATE",
+      }),
+      event(3, "USER_PATCH_RECEIVED", "取消请求作为 UserPatch evidence。", [
+        "绑定 current plan_version=3。",
+      ], { owner: "user_patch_pipeline", planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(23) }),
+      event(4, "USER_PATCH_INTERPRETED", "SlowTask 解释为 explicit cancel。", [
+        "终止当前版本前不发出 SemanticCommitment。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(24) }),
+      event(5, "SLOWTASK_CANCEL_REQUESTED", "SlowTask 请求取消当前任务。", [
+        "如果存在 in-flight tool，按 Tool Executor cancel/stale policy 处理。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(25) }),
+      event(6, "SLOWTASK_CANCELLED", "当前规划任务终止。", [
+        "terminal outcome=CANCELLED。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(26) }),
+      event(7, "SLOWTASK_STATE_CHANGED", "SlowTask 状态进入 CANCELLED。", [
+        "terminal task 不再接受 UserPatch 推进。",
+      ], { planVersion: readonlyPlanVersion(3), taskEventSeq: readonlyTaskEventSeq(26) }),
+    ],
+    liveProgress: [
+      progress(1, "item.started", "planning_v3", "收到取消请求", "正在通过 UserPatch 管道解释，不走 raw text shortcut。", "user_patch_interpreter"),
+      progress(2, "item.completed", "planning_v3", "取消已记录", "SlowTask 终止当前版本；不会输出最终规划。", "slowtask_cancel_boundary"),
+    ],
+    codexProposal: proposal(
+      "proposal_reception_yunnan_cancel",
+      "clarification",
+      "Codex 只建议用明确话术告知任务已取消；它没有权限取消 SlowTask，本次终止来自 SlowTask 事件。",
+      ["evidence://reception-yunnan/turn/cancel-before-final"],
+      ["确认不再输出最终规划。", "说明当前 plan_version 已进入 terminal CANCELLED。", "后续晚到工具结果只能作为 stale/debug evidence。"],
+    ),
+    proposalType: "clarification",
+    answer:
+      "已按 SlowTask cancel flow 终止这版规划：当前 plan_version=3 进入 CANCELLED，最终规划不会输出；如果已有晚到工具结果，只能进入 stale/debug evidence，不能恢复推进任务。",
+  }),
   buildScenario({
     id: "demo_01_new_complex_task",
     title: "场景 1：创建新的复杂任务",

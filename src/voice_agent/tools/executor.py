@@ -58,6 +58,81 @@ class _EmissionContext:
     next_task_event_seq: int = 0
     next_time_offset: int = 0
     caused_by_event_id: str = ""
+    finished: bool = False
+    created_monotonic_ms: int | None = None
+    created_wall_clock_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class ToolExecutionHandle:
+    """A started sandbox call whose result can be completed later.
+
+    The handle is intentionally control-plane local.  It carries the same
+    task/plan binding as the start events and lets a session demonstrate a
+    late result without inventing a second tool execution path.
+    """
+
+    request: ToolExecutionRequest
+    manifest: ToolManifest
+    context: _EmissionContext
+
+    @property
+    def next_task_event_seq(self) -> int:
+        return self.context.next_task_event_seq
+
+    @property
+    def caused_by_event_id(self) -> str:
+        return self.context.caused_by_event_id
+
+    @property
+    def task_id(self) -> str:
+        return self.request.task_id
+
+    @property
+    def plan_version(self) -> int:
+        return self.request.plan_version
+
+    def record_external_event(self, event: Mapping[str, Any]) -> None:
+        """Advance the handle cursor after a SlowTask event between phases."""
+
+        if str(event.get("task_id")) != self.request.task_id:
+            raise ToolExecutionPolicyError("external tool phase event task_id does not match handle")
+        if int(event.get("plan_version", -1)) != self.request.plan_version:
+            raise ToolExecutionPolicyError("external tool phase event plan_version does not match handle")
+        task_event_seq = event.get("task_event_seq")
+        if not isinstance(task_event_seq, int) or isinstance(task_event_seq, bool):
+            raise ToolExecutionPolicyError("external tool phase event requires task_event_seq")
+        if task_event_seq != self.context.next_task_event_seq:
+            raise ToolExecutionPolicyError("external tool phase event must consume the next task_event_seq")
+        self.context.next_task_event_seq = task_event_seq + 1
+        self.context.caused_by_event_id = str(event["event_id"])
+
+    def record_task_event(self, event: Mapping[str, Any]) -> None:
+        """Advance the cursor across a task event, including a plan advance.
+
+        A late tool result keeps the original ``plan_version`` while its
+        ``task_event_seq`` must still follow every intervening UserPatch and
+        replan event.  ``record_external_event`` remains strict for callers
+        that need an unchanged plan binding; this method is the explicit
+        cursor operation for the old-plan late-result path.
+        """
+
+        if str(event.get("task_id")) != self.request.task_id:
+            raise ToolExecutionPolicyError("task event task_id does not match handle")
+        task_event_seq = event.get("task_event_seq")
+        if not isinstance(task_event_seq, int) or isinstance(task_event_seq, bool):
+            raise ToolExecutionPolicyError("task event requires task_event_seq")
+        if task_event_seq != self.context.next_task_event_seq:
+            raise ToolExecutionPolicyError("task event must consume the next task_event_seq")
+        self.context.next_task_event_seq = task_event_seq + 1
+        self.context.caused_by_event_id = str(event["event_id"])
+
+
+@dataclass(frozen=True)
+class ToolExecutionStartResult:
+    produced_events: tuple[dict[str, Any], ...]
+    handle: ToolExecutionHandle | None = None
+    blocking_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,6 +161,17 @@ class DemoToolExecutor:
         self._backend = backend
 
     def execute(self, request: ToolExecutionRequest) -> ToolExecutionResult:
+        started = self.begin(request)
+        if started.handle is None:
+            return ToolExecutionResult(
+                produced_events=started.produced_events,
+                blocking_fields=started.blocking_fields,
+            )
+        return self.complete(started.handle)
+
+    def begin(self, request: ToolExecutionRequest) -> ToolExecutionStartResult:
+        """Emit authorization/start events without completing the backend call."""
+
         _validate_request_shape(request)
         manifest = self._registry.get(request.tool_name)
         _require_current_plan(request, self._journal.events())
@@ -107,7 +193,7 @@ class DemoToolExecutor:
         if missing_fields:
             self._append_arguments_partial(context, missing_fields)
             self._append_blocked_insufficient_arguments(context, missing_fields)
-            return ToolExecutionResult(
+            return ToolExecutionStartResult(
                 produced_events=tuple(context.produced_events),
                 blocking_fields=missing_fields,
             )
@@ -118,16 +204,45 @@ class DemoToolExecutor:
         authorization = self._append_execution_authorized_after_policy_gate(context, manifest)
         self._append_execution_started(context, authorization_event_id=str(authorization["event_id"]))
 
+        return ToolExecutionStartResult(
+            produced_events=tuple(context.produced_events),
+            handle=ToolExecutionHandle(request=request, manifest=manifest, context=context),
+        )
+
+    def complete(
+        self,
+        handle: ToolExecutionHandle,
+        *,
+        created_monotonic_ms: int | None = None,
+        created_wall_clock_ms: int | None = None,
+    ) -> ToolExecutionResult:
+        """Complete a previously authorized sandbox call.
+
+        Completion deliberately does not re-check the current plan.  The
+        original plan binding remains on the result; SlowTask decides whether
+        it is current or stale after the result is journaled.
+        """
+
+        if handle.context.finished:
+            raise ToolExecutionPolicyError("tool execution handle has already completed")
+        context = handle.context
+        manifest = handle.manifest
+        if created_monotonic_ms is not None:
+            context.created_monotonic_ms = created_monotonic_ms
+        if created_wall_clock_ms is not None:
+            context.created_wall_clock_ms = created_wall_clock_ms
+
         try:
             backend_result = self._backend.execute(
                 tool_name=manifest.tool_name,
                 tool_adapter_id=manifest.tool_adapter_id,
-                arguments=request.arguments,
-                idempotency_key=request.idempotency_key,
+                arguments=context.request.arguments,
+                idempotency_key=context.request.idempotency_key,
                 expected_state_namespace=manifest.sandbox_state_namespace,
             )
         except DemoBackendExecutionError as exc:
             self._append_execution_failed(context, failure_reason=exc.reason, retryable=False)
+            context.finished = True
             return ToolExecutionResult(
                 produced_events=tuple(context.produced_events),
                 result_status="FAILED",
@@ -140,6 +255,7 @@ class DemoToolExecutor:
                     failure_reason="demo_backend_ui_patch_namespace_mismatch",
                     retryable=False,
                 )
+                context.finished = True
                 return ToolExecutionResult(
                     produced_events=tuple(context.produced_events),
                     result_status="FAILED",
@@ -162,11 +278,54 @@ class DemoToolExecutor:
             trust_level=manifest.trust_level,
             source_type=manifest.source_type,
         )
+        context.finished = True
         return ToolExecutionResult(
             produced_events=tuple(context.produced_events),
             result_ref=backend_result.result_ref,
             result_status=backend_result.result_status,
             payload=backend_result.payload,
+        )
+
+    def cancel(
+        self,
+        handle: ToolExecutionHandle,
+        *,
+        cancel_reason: str,
+        created_monotonic_ms: int | None = None,
+        created_wall_clock_ms: int | None = None,
+    ) -> ToolExecutionResult:
+        """Close an in-flight demo call through the canonical tool events."""
+
+        if handle.context.finished:
+            raise ToolExecutionPolicyError("tool execution handle has already completed")
+        context = handle.context
+        if not cancel_reason:
+            raise ToolExecutionPolicyError("cancel_reason is required")
+        if created_monotonic_ms is not None:
+            context.created_monotonic_ms = created_monotonic_ms
+        if created_wall_clock_ms is not None:
+            context.created_wall_clock_ms = created_wall_clock_ms
+        requested = self._append_event(
+            context,
+            event_name="TOOL_EXECUTION_CANCEL_REQUESTED",
+            event_id=f"{context.request.event_id_prefix}_execution_cancel_requested",
+            cancel_reason=cancel_reason,
+            tool_name=context.request.tool_name,
+        )
+        context.caused_by_event_id = str(requested["event_id"])
+        cancelled = self._append_event(
+            context,
+            event_name="TOOL_EXECUTION_CANCELLED",
+            event_id=f"{context.request.event_id_prefix}_execution_cancelled",
+            cancel_request_event_id=str(requested["event_id"]),
+            cancel_status="CANCELLED_BY_SLOWTASK",
+            tool_name=context.request.tool_name,
+        )
+        context.caused_by_event_id = str(cancelled["event_id"])
+        context.finished = True
+        return ToolExecutionResult(
+            produced_events=tuple(context.produced_events),
+            result_status="CANCELLED",
         )
 
     def _append_manifest_loaded(self, context: _EmissionContext, manifest: ToolManifest) -> None:
@@ -456,8 +615,16 @@ class DemoToolExecutor:
             event_id=event_id,
             source_module=TOOL_EXECUTOR_SOURCE_MODULE,
             caused_by_event_id=caused_by_event_id or context.caused_by_event_id,
-            created_monotonic_ms=context.request.created_monotonic_ms + context.next_time_offset,
-            created_wall_clock_ms=context.request.created_wall_clock_ms + context.next_time_offset,
+            created_monotonic_ms=(
+                context.created_monotonic_ms
+                if context.created_monotonic_ms is not None
+                else context.request.created_monotonic_ms
+            ) + context.next_time_offset,
+            created_wall_clock_ms=(
+                context.created_wall_clock_ms
+                if context.created_wall_clock_ms is not None
+                else context.request.created_wall_clock_ms
+            ) + context.next_time_offset,
             trace_redaction_level="metadata_only",
             **event_fields,
         )

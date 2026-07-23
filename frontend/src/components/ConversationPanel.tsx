@@ -1,4 +1,10 @@
-import type { CodexProposal, InputMatchMode, SlowSystemScenario } from "../slowSystem";
+import type {
+  CodexProposal,
+  ConversationTurn,
+  InputMatchMode,
+  SlowSystemScenario,
+} from "../slowSystem";
+import { CodexProgressFeed } from "./CodexProgressFeed";
 
 type ConversationPanelProps = Readonly<{
   runScenario: SlowSystemScenario;
@@ -8,6 +14,7 @@ type ConversationPanelProps = Readonly<{
   proposal: CodexProposal | null;
   proposalError: string | null;
   loading: boolean;
+  transcriptTurns: readonly ConversationTurn[];
   onInputTextChange: (value: string) => void;
   onRunMockInput: () => void;
 }>;
@@ -20,6 +27,7 @@ export function ConversationPanel({
   proposal,
   proposalError,
   loading,
+  transcriptTurns,
   onInputTextChange,
   onRunMockInput,
 }: ConversationPanelProps) {
@@ -36,27 +44,8 @@ export function ConversationPanel({
       <p className="scenario-summary">
         {hasRun
           ? runScenario.summary
-          : "选择左侧 demo 只会填充输入框；点击运行后才会生成 Router 分类、SlowTask 状态和 Codex 分析。"}
+          : "选择左侧 demo 只会填充输入框；发送后会追加到同一条聊天记录，并生成 Router 分类、SlowTask 状态和 Codex 分析。"}
       </p>
-
-      <div className="composer-box">
-        <label className="input-label" htmlFor="mock-input">
-          输入 mocklist 里的用户/工具消息
-        </label>
-        <textarea
-          id="mock-input"
-          className="mock-input"
-          value={inputText}
-          onChange={(event) => onInputTextChange(event.target.value)}
-          rows={4}
-        />
-        <div className="composer-actions">
-          <span data-match={matchedBy}>matched_by: {hasRun ? matchedBy : "not_run"}</span>
-          <button className="run-button" type="button" disabled={loading} onClick={onRunMockInput}>
-            {loading ? "Running Router + Codex..." : "Run Router + Codex analysis"}
-          </button>
-        </div>
-      </div>
 
       {hasRun ? (
         <div className="router-summary" aria-label="Router summary">
@@ -85,10 +74,7 @@ export function ConversationPanel({
       )}
 
       <div className="turn-list">
-        {hasRun
-          ? runScenario.conversation
-          .filter((turn) => turn.speaker !== "assistant_fast")
-          .map((turn) => (
+        {transcriptTurns.map((turn) => (
           <article className={`turn turn-${turn.speaker}`} key={turn.id}>
             <div className="turn-meta">
               <span>{labelForSpeaker(turn.speaker)}</span>
@@ -97,9 +83,28 @@ export function ConversationPanel({
             <p>{turn.text}</p>
             <small>{turn.note}</small>
           </article>
-        ))
-          : null}
+        ))}
+        <CodexProgressFeed scenario={runScenario} loading={loading} />
         <CodexAnswerTurn proposal={proposal} loading={loading} error={proposalError} />
+      </div>
+
+      <div className="composer-box">
+        <label className="input-label" htmlFor="mock-input">
+          输入下一条用户/工具消息
+        </label>
+        <textarea
+          id="mock-input"
+          className="mock-input"
+          value={inputText}
+          onChange={(event) => onInputTextChange(event.target.value)}
+          rows={4}
+        />
+        <div className="composer-actions">
+          <span data-match={matchedBy}>matched_by: {hasRun ? matchedBy : "not_run"}</span>
+          <button className="run-button" type="button" disabled={loading} onClick={onRunMockInput}>
+            {loading ? "Running Router + Codex..." : "Send message"}
+          </button>
+        </div>
       </div>
     </section>
   );
@@ -119,8 +124,8 @@ function CodexAnswerTurn({ proposal, loading, error }: CodexAnswerTurnProps) {
           <span>Codex bridge</span>
           <span>calling backend provider</span>
         </div>
-        <p>正在通过后端 bridge 调用 Codex，返回前不会显示分析结果。</p>
-        <small>浏览器不直接调用 Codex；请求走本地 Vite endpoint 和 Python adapter bridge。</small>
+        <p>正在通过后端 bridge 调用 Codex；上方会持续显示安全的阶段和工具进度。</p>
+        <small>浏览器不直接调用 Codex；请求走本地 Vite endpoint、SSE 和 Python adapter bridge。</small>
       </article>
     );
   }
@@ -151,23 +156,7 @@ function CodexAnswerTurn({ proposal, loading, error }: CodexAnswerTurnProps) {
     );
   }
 
-  return (
-    <article className="turn turn-assistant_fast">
-      <div className="turn-meta">
-        <span>Codex analysis</span>
-        <span>backend: {proposal.backendMode}</span>
-      </div>
-      <p>{proposal.summary}</p>
-      {proposal.suggestedNextSteps.length > 0 ? (
-        <ul className="codex-answer-list">
-          {proposal.suggestedNextSteps.map((step) => (
-            <li key={step}>{step}</li>
-          ))}
-        </ul>
-      ) : null}
-      <small>{proposal.boundaryWarning}</small>
-    </article>
-  );
+  return null;
 }
 
 function labelForSpeaker(speaker: SlowSystemScenario["conversation"][number]["speaker"]) {

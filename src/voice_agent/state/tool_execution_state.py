@@ -401,6 +401,8 @@ class ToolExecutionState:
         authorization_event_id = event.get("authorization_event_id")
         if authorization_event_id in (None, ""):
             authorization_event_id = event.get("caused_by_event_id")
+        if call.tool_name is None and event.get("tool_name") not in (None, ""):
+            call.tool_name = str(event["tool_name"])
         call.execution_started = (
             *call.execution_started,
             ExecutionStartedRecord(

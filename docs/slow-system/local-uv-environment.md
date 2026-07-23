@@ -11,11 +11,10 @@ The environment is for local development only. It installs:
 - pytest for the repository test entrypoint
 - OpenAI Python SDK for future adapter-internal Codex-backed proposal work
 
-The Python proposal bridge itself defaults to the deterministic fake provider
-when no provider mode is supplied. The Week 1 React Workbench currently sends
-`provider_mode="codex_cli_local"` with explicit local opt-in by default, and
-keeps the deterministic fake provider available from the UI as a manual
-fallback for reproducible demos.
+The Python Slow-system Workbench defaults to
+`provider_mode="codex_cli_local"` with local execution enabled. The
+deterministic fake provider remains available as an explicit test/demo
+fallback for reproducible runs.
 
 ## Create The Environment
 
@@ -119,8 +118,7 @@ the `Python fake provider (manual fallback)` dropdown option.
 ### Path 2: local Codex Pro account via Codex CLI
 
 Use this only for local developer demos after explicit mentor approval. This is
-the current Week 1 React Workbench default selection, but it still requires
-explicit opt-in in every request. It is implemented as
+the current React Workbench default configuration. It is implemented as
 `provider_mode="codex_cli_local"` with `allow_local_codex_cli=True`, and uses
 the local Codex authentication session created by:
 

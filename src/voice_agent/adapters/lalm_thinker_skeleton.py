@@ -282,7 +282,8 @@ def parse_lalm_thinker_candidate_text(content: str) -> dict[str, Any]:
     stripped = content.strip()
     if not stripped:
         raise LALMThinkerCandidateParseError("empty_content")
-    if "```" in stripped:
+    was_fenced = "```" in stripped
+    if was_fenced:
         stripped = _unwrap_single_json_fence(stripped)
     if not stripped.startswith("{") or not stripped.endswith("}"):
         raise LALMThinkerCandidateParseError("prose_wrapper")
@@ -296,6 +297,8 @@ def parse_lalm_thinker_candidate_text(content: str) -> dict[str, Any]:
         raise LALMThinkerCandidateParseError("multiple_objects")
     if not isinstance(parsed, dict):
         raise LALMThinkerCandidateParseError("candidate_not_object")
+    if was_fenced and not parsed:
+        raise LALMThinkerCandidateParseError("fenced_markdown")
     return parsed
 
 

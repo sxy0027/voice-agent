@@ -16,9 +16,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background:
-    radial-gradient(circle at 88% 8%, rgba(47, 111, 237, 0.08), transparent 28%),
-    linear-gradient(180deg, #f7f8fa 0%, #eef1f5 100%);
+  background: #f4f5f7;
 }
 
 button,
@@ -342,6 +340,9 @@ h3 {
 }
 
 .composer-box {
+  position: sticky;
+  bottom: 16px;
+  z-index: 2;
   border: 1px solid #d9dee8;
   border-radius: 8px;
   background: #ffffff;
@@ -444,9 +445,168 @@ h3 {
   overflow-wrap: anywhere;
 }
 
+.live-progress-panel {
+  display: grid;
+  gap: 12px;
+  overflow: hidden;
+  border: 1px solid #2d3542;
+  border-radius: 10px;
+  background: #181b21;
+  box-shadow: 0 16px 34px rgba(23, 24, 28, 0.16);
+  color: #f2f4f8;
+  padding: 14px;
+}
+
+.live-progress-panel[data-active="true"] {
+  border-color: #4f78a8;
+  box-shadow: 0 0 0 1px rgba(93, 156, 236, 0.16), 0 16px 34px rgba(23, 24, 28, 0.16);
+}
+
+.live-progress-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.live-progress-panel .panel-kicker {
+  color: #8fa7c4;
+}
+
+.live-progress-panel h3 {
+  margin: 4px 0 0;
+  color: #f2f4f8;
+  font-size: 0.96rem;
+}
+
+.live-progress-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  color: #b8c4d4;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.68rem;
+  font-weight: 800;
+  padding: 5px 8px;
+  text-transform: uppercase;
+}
+
+.live-progress-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #6f7785;
+}
+
+.live-progress-panel[data-active="true"] .live-progress-dot {
+  background: #67d39b;
+  box-shadow: 0 0 0 4px rgba(103, 211, 155, 0.13);
+  animation: live-progress-pulse 1.4s ease-in-out infinite;
+}
+
+.live-progress-current {
+  display: grid;
+  gap: 4px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 10px;
+}
+
+.live-progress-current strong {
+  color: #ffffff;
+  font-size: 0.86rem;
+}
+
+.live-progress-current span,
+.live-progress-safety,
+.live-progress-empty {
+  color: #9aa8ba;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.live-progress-list {
+  display: grid;
+  gap: 7px;
+  max-height: 292px;
+  margin: 0;
+  overflow: auto;
+  padding: 0;
+  list-style: none;
+}
+
+.live-progress-item {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  padding-top: 8px;
+}
+
+.live-progress-index {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 6px;
+  background: #2a303b;
+  color: #a8c4e5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.65rem;
+  font-weight: 900;
+}
+
+.live-progress-body {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.live-progress-body strong {
+  color: #e9eef6;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.live-progress-meta {
+  color: #7fa3cb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.67rem;
+  overflow-wrap: anywhere;
+}
+
+.live-progress-body small {
+  color: #8997a9;
+  font-size: 0.71rem;
+  line-height: 1.35;
+}
+
+.live-progress-empty,
+.live-progress-safety {
+  margin: 0;
+}
+
+@keyframes live-progress-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+    transform: scale(0.9);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 .turn-list {
   display: grid;
   gap: 12px;
+  align-items: start;
 }
 
 .turn {
@@ -483,6 +643,7 @@ h3 {
 }
 
 .turn p {
+  white-space: pre-wrap;
   margin: 10px 0;
   color: #22252b;
   line-height: 1.55;
@@ -698,6 +859,28 @@ dd {
   gap: 8px;
 }
 
+.confirmation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.confirmation-actions button {
+  border: 1px solid #d19a4b;
+  border-radius: 999px;
+  background: #fffaf1;
+  color: #7c4a0a;
+  cursor: pointer;
+  font: inherit;
+  padding: 7px 11px;
+}
+
+.confirmation-actions button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
 .plan-version-list,
 .evidence-group {
   display: grid;
@@ -713,6 +896,10 @@ dd {
 
 .plan-version-item[data-status="superseded"] {
   border-left-color: #b76b10;
+}
+
+.plan-version-item[data-status="cancelled"] {
+  border-left-color: #c24135;
 }
 
 .plan-version-item p {
@@ -737,6 +924,14 @@ dd {
 
 .evidence-non_authoritative_hypothesis {
   border-left: 4px solid #b76b10;
+}
+
+.evidence-untrusted_web_evidence {
+  border-left: 4px solid #245ea8;
+}
+
+.evidence-codex_proposal {
+  border-left: 4px solid #6750a4;
 }
 
 .evidence-stale_evidence {

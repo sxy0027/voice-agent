@@ -48,6 +48,10 @@ class InMemoryDemoBackend:
         self._next_alarm_cancel_index = 1
         self._next_flashlight_index = 1
         self._next_web_search_index = 1
+        self._next_company_context_index = 1
+        self._next_itinerary_search_index = 1
+        self._next_itinerary_cost_index = 1
+        self._next_itinerary_preview_index = 1
         self._memo_items: list[dict[str, str]] = []
         self._alarm_items: list[dict[str, str]] = []
         self._flashlight_state = "off"
@@ -113,6 +117,14 @@ class InMemoryDemoBackend:
             return self._execute_weather(tool_name=tool_name, arguments=arguments)
         if tool_adapter_id == "demo.web_search":
             return self._execute_web_search(tool_name=tool_name, arguments=arguments)
+        if tool_adapter_id == "demo.company_context.lookup":
+            return self._execute_company_context_lookup(tool_name=tool_name, arguments=arguments)
+        if tool_adapter_id == "demo.itinerary.search":
+            return self._execute_itinerary_search(tool_name=tool_name, arguments=arguments)
+        if tool_adapter_id == "demo.itinerary.cost_estimate":
+            return self._execute_itinerary_cost_estimate(tool_name=tool_name, arguments=arguments)
+        if tool_adapter_id == "demo.itinerary.preview":
+            return self._execute_itinerary_preview(tool_name=tool_name, arguments=arguments)
         raise DemoBackendExecutionError("demo_backend_adapter_not_supported")
 
     def _execute_memo_create(
@@ -460,6 +472,128 @@ class InMemoryDemoBackend:
                         ),
                     }
                 ],
+                "source": "in_memory_demo_backend",
+            },
+        )
+
+    def _execute_company_context_lookup(
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> DemoBackendResult:
+        company_name = str(arguments["company_name"])
+        normalized_arguments = {key: arguments[key] for key in sorted(arguments)}
+        self._executed_calls.append((tool_name, dict(normalized_arguments)))
+
+        opaque_result_id = f"company_context_{self._next_company_context_index:06d}"
+        self._next_company_context_index += 1
+        return DemoBackendResult(
+            result_status="SUCCEEDED",
+            result_ref=f"result://synthetic/demo_backend/company-context/{opaque_result_id}",
+            progress_type="read_only_lookup_completed",
+            progress_ref=f"progress://synthetic/demo_backend/company-context/{opaque_result_id}/lookup",
+            payload={
+                "company_name": company_name,
+                "company_location": "Synthetic Central Office",
+                "location_fixture": "synthetic_company_fixture",
+                "source": "in_memory_demo_backend",
+            },
+        )
+
+    def _execute_itinerary_search(
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> DemoBackendResult:
+        company_location = str(arguments["company_location"])
+        days = int(arguments["days"])
+        normalized_arguments = {key: arguments[key] for key in sorted(arguments)}
+        self._executed_calls.append((tool_name, dict(normalized_arguments)))
+
+        opaque_result_id = f"itinerary_search_{self._next_itinerary_search_index:06d}"
+        self._next_itinerary_search_index += 1
+        itinerary_ref = f"itinerary://synthetic/demo_backend/{opaque_result_id}"
+        return DemoBackendResult(
+            result_status="SUCCEEDED",
+            result_ref=f"result://synthetic/demo_backend/itinerary/{opaque_result_id}",
+            progress_type="sandbox_itinerary_search_completed",
+            progress_ref=f"progress://synthetic/demo_backend/itinerary/{opaque_result_id}/search",
+            payload={
+                "itinerary_ref": itinerary_ref,
+                "company_location": company_location,
+                "days": days,
+                "options": [
+                    {
+                        "option_ref": f"option://synthetic/{opaque_result_id}/near-office-a",
+                        "label": "Synthetic Office District Stay",
+                        "distance_band": "near_company",
+                    },
+                    {
+                        "option_ref": f"option://synthetic/{opaque_result_id}/near-office-b",
+                        "label": "Synthetic Riverside Meeting Hotel",
+                        "distance_band": "near_company",
+                    },
+                    {
+                        "option_ref": f"option://synthetic/{opaque_result_id}/central-a",
+                        "label": "Synthetic Central Station Hotel",
+                        "distance_band": "short_transit",
+                    },
+                ],
+                "source": "in_memory_demo_backend",
+            },
+        )
+
+    def _execute_itinerary_cost_estimate(
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> DemoBackendResult:
+        itinerary_ref = str(arguments["itinerary_ref"])
+        budget_max = int(arguments["budget_max"])
+        normalized_arguments = {key: arguments[key] for key in sorted(arguments)}
+        self._executed_calls.append((tool_name, dict(normalized_arguments)))
+
+        opaque_result_id = f"itinerary_cost_{self._next_itinerary_cost_index:06d}"
+        self._next_itinerary_cost_index += 1
+        return DemoBackendResult(
+            result_status="SUCCEEDED",
+            result_ref=f"result://synthetic/demo_backend/itinerary-cost/{opaque_result_id}",
+            progress_type="read_only_cost_estimate_completed",
+            progress_ref=f"progress://synthetic/demo_backend/itinerary-cost/{opaque_result_id}/estimate",
+            payload={
+                "itinerary_ref": itinerary_ref,
+                "budget_max": budget_max,
+                "estimated_total": min(budget_max, 420),
+                "currency": "CNY",
+                "within_budget": True,
+                "source": "in_memory_demo_backend",
+            },
+        )
+
+    def _execute_itinerary_preview(
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> DemoBackendResult:
+        itinerary_ref = str(arguments["itinerary_ref"])
+        normalized_arguments = {key: arguments[key] for key in sorted(arguments)}
+        self._executed_calls.append((tool_name, dict(normalized_arguments)))
+
+        opaque_result_id = f"itinerary_preview_{self._next_itinerary_preview_index:06d}"
+        self._next_itinerary_preview_index += 1
+        return DemoBackendResult(
+            result_status="SUCCEEDED",
+            result_ref=f"result://synthetic/demo_backend/itinerary-preview/{opaque_result_id}",
+            progress_type="dry_run_preview_completed",
+            progress_ref=f"progress://synthetic/demo_backend/itinerary-preview/{opaque_result_id}/preview",
+            payload={
+                "itinerary_ref": itinerary_ref,
+                "preview_only": True,
+                "external_side_effect": False,
                 "source": "in_memory_demo_backend",
             },
         )

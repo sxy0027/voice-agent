@@ -1,8 +1,11 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   type CodexProviderMode,
+  confirmWorkbenchSession,
   requestCodexProposal,
+  workbenchSnapshotToScenario,
+  type CodexProposalResult,
 } from "./adapters/codexProposalClient";
 import { CodexProposalPanel } from "./components/CodexProposalPanel";
 import { ConversationPanel } from "./components/ConversationPanel";
@@ -13,7 +16,71 @@ import {
   buildRuntimeScenarioForInput,
   slowSystemScenarios,
 } from "./mockScenarios";
-import type { CodexProposal, InputMatchMode, SlowSystemScenario } from "./slowSystem";
+import type {
+  CodexProposal,
+  ConversationTurn,
+  InputMatchMode,
+  SlowSystemScenario,
+} from "./slowSystem";
+
+const initialTranscriptTurns: readonly ConversationTurn[] = [
+  {
+    id: "system_welcome",
+    speaker: "system",
+    text:
+      "这是一个连续会话 demo。侧边示例只会把消息放进输入框；每次提交都会追加到聊天记录，并通过 Router / SlowTask / Codex proposal bridge 展示过程。",
+    owner: "react_ui",
+    note: "UI owns display state only; SlowTask facts remain owned by runtime snapshots and event journal.",
+  },
+];
+
+function userTranscriptTurn(
+  text: string,
+  scenario: SlowSystemScenario,
+  sequence: number,
+): ConversationTurn {
+  return {
+    id: `turn_${sequence}_user`,
+    speaker: scenario.demoAction === "receive_late_tool_result" ? "tool" : "user",
+    text,
+    owner: scenario.demoAction === "receive_late_tool_result" ? "tool_executor" : "event_journal",
+    note:
+      scenario.demoAction === "receive_late_tool_result"
+        ? "工具结果以原始 plan_version 进入；SlowTask 决定是否 stale/adopt。"
+        : "用户输入先进入 turn ingress / Event Journal，再由 Router 和 SlowTask 处理。",
+  };
+}
+
+function assistantTranscriptTurn(
+  scenario: SlowSystemScenario,
+  proposal: CodexProposal,
+  sequence: number,
+): ConversationTurn {
+  const nextSteps =
+    proposal.suggestedNextSteps.length > 0
+      ? `\n\n建议步骤：${proposal.suggestedNextSteps.join(" / ")}`
+      : "";
+  return {
+    id: `turn_${sequence}_assistant`,
+    speaker: "assistant_fast",
+    text: `${scenario.answer}\n\nCodex proposal: ${proposal.summary}${nextSteps}`,
+    owner: scenario.slowTask.lifecycleState === "COMPLETED" ? "composer" : "codex_proposal",
+    note:
+      scenario.slowTask.lifecycleState === "COMPLETED"
+        ? "最终表达必须覆盖 SlowTask SemanticCommitment；Composer 只负责表达，不改写事实。"
+        : "Codex 输出仍是 proposal；事实、plan_version、tool authorization 和 cancel 由 SlowTask/Event Journal 拥有。",
+  };
+}
+
+function errorTranscriptTurn(message: string, sequence: number): ConversationTurn {
+  return {
+    id: `turn_${sequence}_error`,
+    speaker: "system",
+    text: message,
+    owner: "react_ui",
+    note: "Codex bridge failed closed; no static hidden answer is substituted.",
+  };
+}
 
 function App() {
   const [selectedScenarioId, setSelectedScenarioId] = useState<string | null>(null);
@@ -36,7 +103,20 @@ function App() {
   const [allowLocalCodexCli, setAllowLocalCodexCli] = useState(true);
   const [proposalLoading, setProposalLoading] = useState(false);
   const [proposalError, setProposalError] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [transcriptTurns, setTranscriptTurns] = useState<readonly ConversationTurn[]>(
+    initialTranscriptTurns,
+  );
+  const transcriptSeqRef = useRef(initialTranscriptTurns.length);
   const requestSeqRef = useRef(0);
+  const streamCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      streamCleanupRef.current?.();
+      streamCleanupRef.current = null;
+    };
+  }, []);
 
   const selectedTimelineEvent =
     runScenario.timeline.find((event) => event.id === selectedTimelineEventId) ??
@@ -52,50 +132,63 @@ function App() {
     const result = buildRuntimeScenarioForInput(trimmedInput, selectedScenario);
     const nextScenario = result.scenario;
     setSelectedScenarioId(result.selectedScenarioId);
-    setHasRun(false);
+    setRunScenario(nextScenario);
+    setMatchedBy(result.matchedBy);
+    setSelectedTimelineEventId(nextScenario.timeline[0]?.id ?? "");
+    setHasRun(true);
     setProposal(null);
     setProposalError(null);
+    transcriptSeqRef.current += 1;
+    const userSequence = transcriptSeqRef.current;
+    setTranscriptTurns((turns) => [
+      ...turns,
+      userTranscriptTurn(trimmedInput, nextScenario, userSequence),
+    ]);
     const requestSeq = requestSeqRef.current + 1;
     requestSeqRef.current = requestSeq;
     const backendProposal = await requestProposalForScenario(nextScenario, trimmedInput, requestSeq);
     if (!backendProposal || requestSeqRef.current !== requestSeq) {
       return;
     }
-    setRunScenario(nextScenario);
-    setMatchedBy(result.matchedBy);
-    setSelectedTimelineEventId(nextScenario.timeline[0].id);
+    if (!backendProposal.runtimeSnapshot) {
+      setRunScenario(nextScenario);
+      setMatchedBy(result.matchedBy);
+      setSelectedTimelineEventId(nextScenario.timeline[0].id);
+    }
+    transcriptSeqRef.current += 1;
+    const assistantSequence = transcriptSeqRef.current;
+    setTranscriptTurns((turns) => [
+      ...turns,
+      assistantTranscriptTurn(nextScenario, backendProposal, assistantSequence),
+    ]);
     setHasRun(true);
   };
 
   const selectScenario = (scenarioId: string) => {
-    requestSeqRef.current += 1;
     const nextScenario =
       slowSystemScenarios.find((scenario) => scenario.id === scenarioId) ?? slowSystemScenarios[0];
     setSelectedScenarioId(scenarioId);
     setInputText(nextScenario.mockInput);
-    setRunScenario(nextScenario);
-    setHasRun(false);
-    setMatchedBy("scenario_button");
-    setSelectedTimelineEventId(nextScenario.timeline[0].id);
-    setProposalLoading(false);
-    setProposal(null);
     setProposalError(null);
+    if (!hasRun) {
+      setRunScenario(nextScenario);
+      setMatchedBy("scenario_button");
+      setSelectedTimelineEventId(nextScenario.timeline[0].id);
+    }
   };
 
   const updateInputText = (value: string) => {
-    requestSeqRef.current += 1;
     setInputText(value);
-    setHasRun(false);
-    setProposalLoading(false);
-    setProposal(null);
     setProposalError(null);
   };
 
   const updateProviderMode = (mode: CodexProviderMode) => {
     requestSeqRef.current += 1;
+    streamCleanupRef.current?.();
+    streamCleanupRef.current = null;
     setProviderMode(mode);
     setAllowLocalCodexCli(mode === "codex_cli_local");
-    setHasRun(false);
+    setSessionId(null);
     setProposalLoading(false);
     setProposal(null);
     setProposalError(null);
@@ -105,7 +198,7 @@ function App() {
     scenario: SlowSystemScenario,
     intent: string,
     requestSeq = requestSeqRef.current + 1,
-  ): Promise<CodexProposal | null> => {
+  ): Promise<CodexProposalResult | null> => {
     requestSeqRef.current = requestSeq;
     setProposalLoading(true);
     setProposalError(null);
@@ -116,15 +209,70 @@ function App() {
         intent,
         providerMode,
         allowLocalCodexCli,
+        sessionId,
+        onSessionCreated: (createdSessionId, snapshot) => {
+          if (requestSeqRef.current !== requestSeq) {
+            return;
+          }
+          setSessionId(createdSessionId);
+          const dynamicScenario = workbenchSnapshotToScenario(
+            snapshot,
+            intent,
+            scenario,
+            scenario.codexProposal,
+          );
+          setRunScenario(dynamicScenario);
+          setSelectedScenarioId(null);
+          setMatchedBy("dynamic_router");
+          setSelectedTimelineEventId(dynamicScenario.timeline[0]?.id ?? "");
+          setHasRun(true);
+        },
+        onSnapshot: (snapshot) => {
+          if (requestSeqRef.current !== requestSeq) {
+            return;
+          }
+          const dynamicScenario = workbenchSnapshotToScenario(
+            snapshot,
+            intent,
+            scenario,
+            proposal ?? scenario.codexProposal,
+          );
+          setRunScenario(dynamicScenario);
+          setSelectedScenarioId(null);
+          setMatchedBy("dynamic_router");
+          setSelectedTimelineEventId(dynamicScenario.timeline[0]?.id ?? "");
+          setHasRun(true);
+        },
+        onStreamStarted: (stop) => {
+          streamCleanupRef.current?.();
+          streamCleanupRef.current = stop;
+        },
       });
       if (requestSeqRef.current !== requestSeq) {
         return null;
+      }
+      if (backendProposal.sessionId && backendProposal.runtimeSnapshot) {
+        setSessionId(backendProposal.sessionId);
+        const dynamicScenario = workbenchSnapshotToScenario(
+          backendProposal.runtimeSnapshot,
+          intent,
+          scenario,
+          backendProposal,
+        );
+        setRunScenario(dynamicScenario);
+        setSelectedScenarioId(null);
+        setMatchedBy("dynamic_router");
+        setSelectedTimelineEventId(dynamicScenario.timeline[0]?.id ?? "");
       }
       setProposal(backendProposal);
       return backendProposal;
     } catch (error) {
       if (requestSeqRef.current === requestSeq) {
-        setProposalError(error instanceof Error ? error.message : "Codex proposal request failed");
+        const message = error instanceof Error ? error.message : "Codex proposal request failed";
+        setProposalError(message);
+        transcriptSeqRef.current += 1;
+        const errorSequence = transcriptSeqRef.current;
+        setTranscriptTurns((turns) => [...turns, errorTranscriptTurn(message, errorSequence)]);
       }
       return null;
     } finally {
@@ -147,6 +295,57 @@ function App() {
     const requestSeq = requestSeqRef.current + 1;
     requestSeqRef.current = requestSeq;
     await requestProposalForScenario(runScenario, trimmedInput, requestSeq);
+  };
+
+  const confirmCurrentTask = async (accepted: boolean) => {
+    const pending = runScenario.slowTask.pendingConfirmation;
+    if (!sessionId || !pending) {
+      setProposalError("当前页面没有 Python-owned pending confirmation。");
+      return;
+    }
+    const requestSeq = requestSeqRef.current + 1;
+    requestSeqRef.current = requestSeq;
+    setProposalLoading(true);
+    setProposalError(null);
+    try {
+      const snapshot = await confirmWorkbenchSession(sessionId, pending.confirmationId, accepted);
+      if (requestSeqRef.current !== requestSeq) {
+        return;
+      }
+      const dynamicScenario = workbenchSnapshotToScenario(
+        snapshot,
+        accepted ? "确认取消当前任务" : "保留当前任务，不取消",
+        runScenario,
+        proposal ?? runScenario.codexProposal,
+      );
+      setRunScenario(dynamicScenario);
+      setSelectedTimelineEventId(dynamicScenario.timeline[0]?.id ?? "");
+      setHasRun(true);
+      transcriptSeqRef.current += 1;
+      const userSequence = transcriptSeqRef.current;
+      transcriptSeqRef.current += 1;
+      const assistantSequence = transcriptSeqRef.current;
+      const confirmationText = accepted ? "确认取消当前任务。" : "保留当前任务，不取消。";
+      setTranscriptTurns((turns) => [
+        ...turns,
+        userTranscriptTurn(confirmationText, dynamicScenario, userSequence),
+        {
+          id: `turn_${assistantSequence}_confirmation`,
+          speaker: "assistant_fast",
+          text: accepted
+            ? "已记录用户确认，SlowTask 会按 current-plan confirmation 终止任务。"
+            : "已记录用户拒绝取消，SlowTask 继续保留当前任务。",
+          owner: "composer",
+          note: "confirmation 结果来自 Python-owned SlowTask snapshot，不是 React 直接改事实。",
+        },
+      ]);
+    } catch (error) {
+      setProposalError(error instanceof Error ? error.message : "Workbench confirmation failed");
+    } finally {
+      if (requestSeqRef.current === requestSeq) {
+        setProposalLoading(false);
+      }
+    }
   };
 
   const markProposal = (status: "accepted" | "rejected") => {
@@ -196,6 +395,7 @@ function App() {
           proposal={proposal}
           proposalError={proposalError}
           loading={proposalLoading}
+          transcriptTurns={transcriptTurns}
           onInputTextChange={updateInputText}
           onRunMockInput={runMockInput}
         />
@@ -230,6 +430,8 @@ function App() {
           hasRun={hasRun}
           loading={proposalLoading}
           proposal={proposal}
+          sessionId={sessionId}
+          onConfirm={confirmCurrentTask}
         />
 
         <CodexProposalPanel

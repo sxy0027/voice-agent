@@ -24,7 +24,7 @@ Codex 只拥有 proposal / draft / 建议。
 
 它可以帮我们生成候选实现方案、说明可能的下一步、起草 UI patch 想法，或者提醒哪些边界要注意。但这些内容在被系统边界接收之前，只是草稿。
 
-在这个 Week 1 demo 里，Codex proposal 通过本地 Vite endpoint 调到 Python `slow_system_workbench_codex` bridge。当前页面默认选择 `Local Codex CLI`，并带着显式 local opt-in 请求后端；如果本机没有登录或不可用，后端会 fail closed，页面也可以手动切到 `Python fake provider` 做稳定演示。无论 proposal 来源是 fake 还是 local CLI，页面都明确写了 “Proposal only”。它不能直接写 Event Journal，不能推进 `plan_version`，不能执行工具，不能授权工具，也不能生成最终 `SemanticCommitment`。
+在这个 Week 1 demo 里，Codex proposal 通过本地 Vite endpoint 调到 Python `slow_system_workbench_codex` bridge。当前页面默认选择 `Local Codex CLI`，Workbench 默认配置也启用本地 CLI；如果本机没有登录或不可用，后端会 fail closed/degraded，页面也可以手动切到 `Python fake provider` 做稳定演示。无论 proposal 来源是 fake 还是 local CLI，页面都明确写了 “Proposal only”。它不能直接写 Event Journal，不能推进 `plan_version`，不能执行工具，不能授权工具，也不能生成最终 `SemanticCommitment`。
 
 ## 为什么 Codex 只能做 proposal？
 

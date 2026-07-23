@@ -12,11 +12,13 @@ describe("App", () => {
   it("renders the interactive mocklist with Router and SlowTask ownership", () => {
     render(<App />);
 
-    expect(screen.getByLabelText("输入 mocklist 里的用户/工具消息")).toBeTruthy();
+    expect(screen.getByLabelText("输入下一条用户/工具消息")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "接待午饭" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "1 新任务" })).toBeTruthy();
     expect(screen.queryByText("SPAWN_SLOW_TASK")).toBeNull();
     expect(screen.getAllByText("not_run").length).toBeGreaterThan(0);
     expect(screen.getByText("No SlowTask facts yet")).toBeTruthy();
+    expect(screen.getByText(/这是一个连续会话 demo/)).toBeTruthy();
     expect(screen.getByText("Request backend proposal")).toBeTruthy();
     expect(screen.getByText("No Codex result yet")).toBeTruthy();
     expect((screen.getByLabelText("Provider") as HTMLSelectElement).value).toBe(
@@ -31,16 +33,17 @@ describe("App", () => {
     const { fetchMock, resolve } = stubDeferredProposalFetch();
     render(<App />);
 
-    fireEvent.change(screen.getByLabelText("输入 mocklist 里的用户/工具消息"), {
+    fireEvent.change(screen.getByLabelText("输入下一条用户/工具消息"), {
       target: { value: "改成明天上午，并且预算控制在 500 元以内。" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Run Router + Codex analysis" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    expect(screen.queryByText("PATCH_ACTIVE_SLOW_TASK")).toBeNull();
-    expect(screen.queryByText("plan_version=2")).toBeNull();
-    expect(screen.getByText("No SlowTask facts yet")).toBeTruthy();
-    expect(screen.getByText("正在通过后端 bridge 调用 Codex，返回前不会显示分析结果。")).toBeTruthy();
+    expect(screen.getAllByText("PATCH_ACTIVE_SLOW_TASK").length).toBeGreaterThan(0);
+    expect(screen.getByText("plan_version=2")).toBeTruthy();
+    expect(screen.queryByText("No SlowTask facts yet")).toBeNull();
+    expect(screen.getAllByText("改成明天上午，并且预算控制在 500 元以内。").length).toBeGreaterThan(0);
+    expect(screen.getByText("正在通过后端 bridge 调用 Codex；上方会持续显示安全的阶段和工具进度。")).toBeTruthy();
 
     resolve();
     await waitFor(() => expect(screen.getAllByText("PATCH_ACTIVE_SLOW_TASK").length).toBeGreaterThan(0));
@@ -67,15 +70,18 @@ describe("App", () => {
     expect(screen.getByText("No SlowTask facts yet")).toBeTruthy();
     expect(screen.queryByText(/Stale evidence bucket/)).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Run Router + Codex analysis" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getByText(/Stale evidence bucket/)).toBeTruthy());
     expect(screen.getByText(/TOOL_RESULT_MARKED_STALE/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "4 确认" }));
-    expect(screen.getByText("No SlowTask facts yet")).toBeTruthy();
+    expect(screen.getByText(/Stale evidence bucket/)).toBeTruthy();
+    expect((screen.getByLabelText("输入下一条用户/工具消息") as HTMLTextAreaElement).value).toContain(
+      "取消",
+    );
 
-    fireEvent.click(screen.getByRole("button", { name: "Run Router + Codex analysis" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getAllByText("CANCEL_OR_PAUSE_CANDIDATE").length).toBeGreaterThan(0));
     expect(screen.getByText(/Pending confirmation/)).toBeTruthy();
@@ -87,10 +93,10 @@ describe("App", () => {
     render(<App />);
 
     const customInput = "请评估一个没有写进清单的准备事项。";
-    fireEvent.change(screen.getByLabelText("输入 mocklist 里的用户/工具消息"), {
+    fireEvent.change(screen.getByLabelText("输入下一条用户/工具消息"), {
       target: { value: customInput },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Run Router + Codex analysis" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getAllByText("dynamic_router").length).toBeGreaterThan(0));
@@ -102,6 +108,42 @@ describe("App", () => {
     };
     expect(payload.intent).toBe(customInput);
     expect(payload.snapshot.task.evidence[0].summary).toContain(customInput);
+  });
+
+  it("keeps the Yunnan reception planning flow in one transcript", async () => {
+    const fetchMock = stubProposalFetch();
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "接待午饭" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getAllByText("请帮忙规划一个接待午饭，选云南菜。").length).toBeGreaterThan(0),
+    );
+    expect(screen.getByText("缺失字段审查")).toBeTruthy();
+    expect(screen.getByText(/memory:\/\/session\/reception_meal\/preferences\/v1/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "改晚上" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(screen.getAllByText("请帮忙规划一个接待午饭，选云南菜。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("中间我插一句，把时间修改到晚上吧。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/TOOL_RESULT_MARKED_STALE/).length).toBeGreaterThan(0);
+  });
+
+  it("shows Week 2 evidence trust labels without mixing hypotheses into authoritative evidence", async () => {
+    const fetchMock = stubProposalFetch();
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "补接待数据" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(screen.getByText("Authoritative evidence")).toBeTruthy();
+    expect(screen.getByText("Untrusted web evidence")).toBeTruthy();
+    expect(screen.getAllByText(/trust=authoritative/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/trust=untrusted_web_evidence/)).toBeTruthy();
+    expect(screen.getByText(/UNTRUSTED_WEB_EVIDENCE/)).toBeTruthy();
   });
 });
 

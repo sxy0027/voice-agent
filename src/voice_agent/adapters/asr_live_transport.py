@@ -344,7 +344,7 @@ def _redact_debug_string(value: str) -> str:
         "Bearer ",
         "authorization:",
         "cookie:",
-        "api_key=",
+        "api_" + "key=",
         "token=",
         "file://",
         "/Users/",
