@@ -585,6 +585,34 @@ h3 {
   line-height: 1.35;
 }
 
+.live-progress-details {
+  display: grid;
+  gap: 5px;
+  margin: 4px 0 0;
+}
+
+.live-progress-details div {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.live-progress-details dt {
+  color: #8fa7c4;
+  font-size: 0.66rem;
+  font-weight: 800;
+}
+
+.live-progress-details dd {
+  min-width: 0;
+  margin: 0;
+  color: #c9d2df;
+  font-size: 0.71rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .live-progress-empty,
 .live-progress-safety {
   margin: 0;

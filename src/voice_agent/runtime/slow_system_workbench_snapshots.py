@@ -39,6 +39,14 @@ class ProviderTraceItem:
     detail: str | None = None
     phase: str | None = None
     label: str | None = None
+    orchestration_role: str | None = None
+    subtask_id: str | None = None
+    subtask_goal: str | None = None
+    public_thought: str | None = None
+    tool_input_summary: str | None = None
+    tool_output_summary: str | None = None
+    next_step: str | None = None
+    blocked_on_user: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -62,6 +70,14 @@ class ProviderTraceItem:
             ("detail", self.detail),
             ("phase", self.phase),
             ("label", self.label),
+            ("orchestration_role", self.orchestration_role),
+            ("subtask_id", self.subtask_id),
+            ("subtask_goal", self.subtask_goal),
+            ("public_thought", self.public_thought),
+            ("tool_input_summary", self.tool_input_summary),
+            ("tool_output_summary", self.tool_output_summary),
+            ("next_step", self.next_step),
+            ("blocked_on_user", self.blocked_on_user),
         ):
             if value is not None:
                 result[field_name] = value
@@ -263,6 +279,11 @@ def _public_task(
     )
     pending = _public_pending_confirmation(task)
     tool_calls = _public_tool_calls(tool_execution_state, task_id=task.task_id)
+    current_missing_fields = (
+        _task_fields(task, {"WAITING_FOR_SLOT", "INSUFFICIENT_EVIDENCE_FOR_ACTION", "CLARIFICATION_REQUESTED"})
+        if task.lifecycle_state == "WAITING_FOR_SLOT"
+        else []
+    )
     return {
         "task_id": task.task_id,
         "lifecycle": task.lifecycle_state,
@@ -280,7 +301,7 @@ def _public_task(
             "refs": list(task.resolved_arguments_refs[-8:]),
             "provenance_refs": list(task.argument_provenance_refs[-12:]),
         },
-        "missing_fields": _task_fields(task, {"WAITING_FOR_SLOT", "INSUFFICIENT_EVIDENCE_FOR_ACTION", "CLARIFICATION_REQUESTED"}),
+        "missing_fields": current_missing_fields,
         "conflicting_fields": _task_fields(task, {"AMBIGUITY_DETECTED"}),
         "plan_versions": plan_versions,
         "evidence": current_evidence,
@@ -366,13 +387,43 @@ def _public_plan_versions(
         }
     ]
     for advance in task.plan_advances:
+        summary = "用户 material patch 导致当前计划重新规划。"
+        interpretation_reason = ""
+        if advance.caused_by_user_patch_event_id:
+            interpretation_reason = next(
+                (
+                    item.interpretation_reason or ""
+                    for item in reversed(task.user_patch_interpretations)
+                    if item.caused_by_event_id == advance.caused_by_user_patch_event_id
+                    and item.materially_changes_task
+                ),
+                "",
+            )
+            patch_evidence_ref = next(
+                (
+                    evidence.evidence_ref
+                    for evidence in task.user_patch_evidence
+                    if evidence.event_id == advance.caused_by_user_patch_event_id
+                ),
+                None,
+            )
+            summary = str(
+                evidence_catalog.get(patch_evidence_ref or advance.caused_by_user_patch_event_id, {}).get(
+                    "summary",
+                    summary,
+                )
+            )
         result[-1]["status"] = "superseded"
         result.append(
             {
                 "plan_version": advance.to_plan_version,
                 "status": "current" if advance.to_plan_version == task.current_plan_version else "superseded",
-                "summary": "用户 material patch 后的 synthetic current plan。",
-                "reason": "user_patch" if advance.caused_by_user_patch_event_id else "manual_demo",
+                "summary": _safe_summary(summary),
+                "reason": (
+                    "user_patch:" + _safe_summary(interpretation_reason)
+                    if interpretation_reason
+                    else "user_patch" if advance.caused_by_user_patch_event_id else "manual_demo"
+                ),
                 "created_by_event_id": advance.event_id,
             }
         )
@@ -570,9 +621,17 @@ def _task_fields(task: SlowTaskRecord, names: set[str]) -> list[str]:
         if event.event_name not in names:
             continue
         for ref in event.refs:
+            if not _field_like(ref):
+                continue
             if ref not in values:
                 values.append(ref)
     return values[:24]
+
+
+def _field_like(value: str) -> bool:
+    if "://" in value:
+        return False
+    return all(char.isalnum() or char == "_" for char in value)
 
 
 def _active_or_last_task(state: SlowTaskState) -> SlowTaskRecord | None:

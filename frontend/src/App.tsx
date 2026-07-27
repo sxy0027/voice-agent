@@ -55,21 +55,45 @@ function assistantTranscriptTurn(
   scenario: SlowSystemScenario,
   proposal: CodexProposal,
   sequence: number,
+  runtimeAnswer?: string,
 ): ConversationTurn {
-  const nextSteps =
-    proposal.suggestedNextSteps.length > 0
-      ? `\n\n建议步骤：${proposal.suggestedNextSteps.join(" / ")}`
-      : "";
+  const pending = scenario.slowTask.pendingConfirmation;
+  const missingFields = scenario.slowTask.lifecycleState === "WAITING_FOR_SLOT"
+    ? scenario.slowTask.missingFields.length > 0
+      ? scenario.slowTask.missingFields
+      : proposal.missingFields
+    : [];
+  const text = runtimeAnswer || (pending
+    ? `${pending.prompt}\n\n${pending.riskSummary}`
+    : missingFields.length > 0
+      ? `我已经记录了需求，但还需要你补充 ${userFacingMissingFields(missingFields)}。请直接给出可定位的信息，例如“北京市海淀区中关村领展购物广场附近”，以及“7 月 25 日 18:30 的晚餐”。在这些信息确定前，我不会把猜测当成餐厅候选。`
+      : scenario.slowTask.lifecycleState === "EXECUTING"
+        ? "好的，信息够了。我先按你给的范围去查一个沙盒里的候选方案；你也可以继续补充预算、人数或偏好。"
+        : scenario.slowTask.lifecycleState === "CANCELLED"
+          ? "好的，这个任务我已经按你的确认取消了，不会继续推进。"
+          : scenario.slowTask.lifecycleState === "COMPLETED"
+            ? scenario.answer
+            : proposal.summary);
   return {
     id: `turn_${sequence}_assistant`,
     speaker: "assistant_fast",
-    text: `${scenario.answer}\n\nCodex proposal: ${proposal.summary}${nextSteps}`,
+    text,
     owner: scenario.slowTask.lifecycleState === "COMPLETED" ? "composer" : "codex_proposal",
     note:
       scenario.slowTask.lifecycleState === "COMPLETED"
         ? "最终表达必须覆盖 SlowTask SemanticCommitment；Composer 只负责表达，不改写事实。"
-        : "Codex 输出仍是 proposal；事实、plan_version、tool authorization 和 cancel 由 SlowTask/Event Journal 拥有。",
+        : "面向用户的回复只表达当前可承诺状态；调试字段留在 snapshot/timeline/proposal 面板。",
   };
+}
+
+function userFacingMissingFields(fields: readonly string[]): string {
+  const labels: Record<string, string> = {
+    time_window: "具体时间",
+    location_anchor: "地点范围",
+    budget_or_time_preference: "预算或时间偏好",
+    party_size: "人数",
+  };
+  return fields.map((field) => labels[field] ?? field).join("、");
 }
 
 function errorTranscriptTurn(message: string, sequence: number): ConversationTurn {
@@ -150,6 +174,14 @@ function App() {
     if (!backendProposal || requestSeqRef.current !== requestSeq) {
       return;
     }
+    const effectiveScenario = backendProposal.runtimeSnapshot
+      ? workbenchSnapshotToScenario(
+          backendProposal.runtimeSnapshot,
+          trimmedInput,
+          nextScenario,
+          backendProposal,
+        )
+      : nextScenario;
     if (!backendProposal.runtimeSnapshot) {
       setRunScenario(nextScenario);
       setMatchedBy(result.matchedBy);
@@ -159,7 +191,12 @@ function App() {
     const assistantSequence = transcriptSeqRef.current;
     setTranscriptTurns((turns) => [
       ...turns,
-      assistantTranscriptTurn(nextScenario, backendProposal, assistantSequence),
+      assistantTranscriptTurn(
+        effectiveScenario,
+        backendProposal,
+        assistantSequence,
+        latestRuntimeAssistantAnswer(effectiveScenario),
+      ),
     ]);
     setHasRun(true);
   };
@@ -448,6 +485,13 @@ function App() {
       </aside>
     </main>
   );
+}
+
+function latestRuntimeAssistantAnswer(scenario: SlowSystemScenario): string | undefined {
+  const latest = [...scenario.conversation]
+    .reverse()
+    .find((turn) => turn.speaker === "assistant_fast" || turn.speaker === "system");
+  return latest?.text || undefined;
 }
 
 export default App;

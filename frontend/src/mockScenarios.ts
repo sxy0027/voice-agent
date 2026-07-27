@@ -42,8 +42,9 @@ const proposal = (
   label: "Proposal only",
   summary,
   suggestedNextSteps,
-  missingFields: proposalType === "clarification" ? ["explicit_user_confirmation"] : [],
-  requiresConfirmation: proposalType === "clarification" || proposalType === "tool_preview",
+  // Do not expose internal enum names in the customer-facing mock reply.
+  missingFields: [],
+  requiresConfirmation: proposalType === "tool_preview",
   riskNotes: [
     "Codex proposal only — not committed to SlowTask.",
     "Codex 不推进 plan_version，不写 Event Journal，不授权工具。",
@@ -199,6 +200,8 @@ const buildScenario = (input: BuildScenarioInput): SlowSystemScenario => ({
     currentPlanVersion: readonlyPlanVersion(input.currentPlanVersion),
     currentTaskEventSeq: readonlyTaskEventSeq(input.currentTaskEventSeq),
     planVersions: input.planVersions,
+    missingFields: input.codexProposal.missingFields,
+    conflictingFields: [],
     pendingConfirmation: input.pendingConfirmation,
     semanticCommitmentStatus: "not_emitted_yet",
     staleEvidencePolicy:
@@ -331,8 +334,8 @@ export const slowSystemScenarios: readonly SlowSystemScenario[] = [
     title: "主线：用户补充接待数据",
     shortName: "补接待数据",
     demoAction: "send_user_patch",
-    mockInput: "8个人，客户住在公司附近，人均200以内，有两位不吃辣，最好12点半。",
-    matchKeywords: ["8个人", "人均200", "不吃辣", "12点半", "公司附近"],
+    mockInput: "8个人，地点在北京市海淀区中关村领展购物广场附近，人均200以内，有两位不吃辣，最好12点半。",
+    matchKeywords: ["8个人", "人均200", "不吃辣", "12点半", "中关村", "领展"],
     summary:
       "用户补齐关键接待数据；SlowTask 将补充内容作为 UserPatch evidence，推进到 plan_version=2 并准备 demo tool 查询。",
     routerDecision: "PATCH_ACTIVE_SLOW_TASK",
@@ -354,7 +357,7 @@ export const slowSystemScenarios: readonly SlowSystemScenario[] = [
       {
         planVersion: 2,
         status: "current",
-        summary: "加入 8 人、公司附近、人均 200、两位不吃辣、12:30 午饭。",
+        summary: "加入 8 人、海淀中关村领展购物广场附近、人均 200、两位不吃辣、12:30 午饭。",
         reason: "user_patch",
         createdByEventId: "evt_reception_v2_plan_version_advanced",
       },
@@ -363,7 +366,7 @@ export const slowSystemScenarios: readonly SlowSystemScenario[] = [
       evidence(
         "demo_06_user_patch",
         "UserPatch evidence",
-        "用户补充：8 人、公司附近、人均 200 以内、两位不吃辣、12:30。",
+        "用户补充：8 人、北京市海淀区中关村领展购物广场附近、人均 200 以内、两位不吃辣、12:30。",
         1,
         "evidence://reception-yunnan/turn/details",
       ),
@@ -619,7 +622,7 @@ export const slowSystemScenarios: readonly SlowSystemScenario[] = [
     ),
     proposalType: "commitment_draft",
     answer:
-      "最终规划：按 8 人晚餐接待处理，选择公司附近云南菜，人均控制在 200 以内；点单以菌菇、汽锅鸡、清炒时蔬、低辣过桥米线/米线小份等照顾不吃辣客人，另保留两道云南特色中辣菜给可吃辣成员。建议 18:30 到店，18:20 前集合；实际订位仍需人工确认，因为 MVP demo 工具不执行真实预订。",
+      "最终规划会基于当前 plan 的只读地点检索结果生成：展示候选名称、来源链接、到店建议和不吃辣的点菜约束。若外部检索没有返回足够可靠的证据，系统会说明未能可靠推荐，而不会写死或编造餐厅名称；MVP 不执行真实预订。",
   }),
   buildScenario({
     id: "demo_09_reception_yunnan_cancel",

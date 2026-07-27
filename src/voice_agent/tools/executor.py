@@ -248,6 +248,32 @@ class DemoToolExecutor:
                 result_status="FAILED",
             )
 
+        return self.complete_with_backend_result(handle, backend_result)
+
+    def complete_with_backend_result(
+        self,
+        handle: ToolExecutionHandle,
+        backend_result: Any,
+        *,
+        created_monotonic_ms: int | None = None,
+        created_wall_clock_ms: int | None = None,
+    ) -> ToolExecutionResult:
+        """Journal a normalized adapter result on the control-plane thread.
+
+        A read-only adapter may perform its blocking I/O outside this executor.
+        The caller returns to the async control plane before invoking this
+        method, so critical journal writes remain serialized here.
+        """
+
+        context = handle.context
+        manifest = handle.manifest
+        if context.finished:
+            raise ToolExecutionPolicyError("tool execution handle has already completed")
+        if created_monotonic_ms is not None:
+            context.created_monotonic_ms = created_monotonic_ms
+        if created_wall_clock_ms is not None:
+            context.created_wall_clock_ms = created_wall_clock_ms
+
         if manifest.ui_patch_capable and backend_result.ui_patch is not None:
             if backend_result.ui_patch.state_namespace != manifest.sandbox_state_namespace:
                 self._append_execution_failed(

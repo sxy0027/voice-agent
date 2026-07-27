@@ -139,7 +139,11 @@ class TaskContextPackBuilder:
             evidence_catalog=evidence_catalog,
             current_plan_version=current_plan_version,
         )
-        missing_fields, conflicting_fields = _missing_and_conflicting_fields(task)
+        missing_fields, conflicting_fields = (
+            _missing_and_conflicting_fields(task)
+            if task.lifecycle_state == "WAITING_FOR_SLOT"
+            else ((), ())
+        )
         plan_history = _plan_history(
             task,
             evidence_catalog=evidence_catalog,
@@ -302,10 +306,16 @@ def _missing_and_conflicting_fields(task: SlowTaskRecord) -> tuple[tuple[str, ..
     conflicting: list[str] = []
     for event in task.evidence_events:
         if event.event_name in {"WAITING_FOR_SLOT", "INSUFFICIENT_EVIDENCE_FOR_ACTION", "CLARIFICATION_REQUESTED"}:
-            missing.extend(event.refs)
+            missing.extend(ref for ref in event.refs if _field_like(ref))
         if event.event_name == "AMBIGUITY_DETECTED":
-            conflicting.extend(event.refs)
+            conflicting.extend(ref for ref in event.refs if _field_like(ref))
     return _unique_strings(missing), _unique_strings(conflicting)
+
+
+def _field_like(value: str) -> bool:
+    if "://" in value:
+        return False
+    return all(char.isalnum() or char == "_" for char in value)
 
 
 def _current_constraints(task: SlowTaskRecord, accepted: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -346,7 +356,17 @@ def _plan_history(
     ]
     for advance in task.plan_advances:
         summary = "用户 material patch 导致当前计划重新规划。"
+        interpretation_reason = ""
         if advance.caused_by_user_patch_event_id:
+            interpretation_reason = next(
+                (
+                    item.interpretation_reason or ""
+                    for item in reversed(task.user_patch_interpretations)
+                    if item.caused_by_event_id == advance.caused_by_user_patch_event_id
+                    and item.materially_changes_task
+                ),
+                "",
+            )
             patch_evidence_ref = next(
                 (
                     evidence.evidence_ref
@@ -368,7 +388,11 @@ def _plan_history(
             {
                 "plan_version": advance.to_plan_version,
                 "status": "current" if advance.to_plan_version == task.current_plan_version else "superseded",
-                "reason": "user_patch" if advance.caused_by_user_patch_event_id else "manual_demo",
+                "reason": (
+                    "user_patch:" + _bounded_text(interpretation_reason)
+                    if interpretation_reason
+                    else "user_patch" if advance.caused_by_user_patch_event_id else "manual_demo"
+                ),
                 "summary": summary,
                 "created_by_event_id": advance.event_id,
             }

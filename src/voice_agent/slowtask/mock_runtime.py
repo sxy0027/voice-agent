@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from voice_agent.events.journal import InMemoryEventJournal
@@ -361,6 +362,45 @@ class MockSlowTaskRuntime:
             produced_events=(finalizing, commitment, completed),
         )
 
+    def mark_current_plan_ready_for_revision(
+        self,
+        *,
+        task_id: str,
+        plan_version: int,
+        current_lifecycle_state: str,
+        caused_by_event_id: str,
+        event_id_prefix: str,
+        created_monotonic_ms: int,
+        created_wall_clock_ms: int,
+        task_event_seq: int,
+    ) -> MockSlowTaskRunResult:
+        """Return from a finished read-only lookup to a mutable planning state.
+
+        This intentionally emits no SemanticCommitment and no terminal state.
+        It uses the existing canonical SLOWTASK_STATE_CHANGED event so a
+        following material UserPatch is processed against the same task and
+        advances its plan_version rather than creating a replacement task.
+        """
+
+        state_changed = self._append_slowtask_event(
+            event_name="SLOWTASK_STATE_CHANGED",
+            event_id=f"{event_id_prefix}_state_planning",
+            caused_by_event_id=caused_by_event_id,
+            created_monotonic_ms=created_monotonic_ms,
+            created_wall_clock_ms=created_wall_clock_ms,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=task_event_seq,
+            from_state=current_lifecycle_state,
+            to_state="PLANNING",
+            reason="read_only_evidence_ready_for_current_plan_revision",
+        )
+        return MockSlowTaskRunResult(
+            task_id=task_id,
+            plan_version=plan_version,
+            produced_events=(state_changed,),
+        )
+
     def run_planning_completed(
         self,
         *,
@@ -532,6 +572,8 @@ class MockSlowTaskRuntime:
         confirmation_signal: str | None = None,
         authorization_ref: str | None = None,
         return_to_state: str = "PLANNING",
+        current_resolved_slots: Mapping[str, str] | None = None,
+        incoming_slot_values: Mapping[str, str] | None = None,
     ) -> MockSlowTaskRunResult:
         _validate_user_patch_received_event(user_patch_event)
         if not event_id_prefix:
@@ -543,7 +585,11 @@ class MockSlowTaskRuntime:
         current_plan_version = _int_field(user_patch_event, "plan_version")
         next_task_event_seq = _int_field(user_patch_event, "task_event_seq") + 1
         interpretation_type, materially_changes_task, interpretation_reason = (
-            _mock_interpretation_from_user_patch(user_patch_event)
+            _mock_interpretation_from_user_patch(
+                user_patch_event,
+                current_resolved_slots=current_resolved_slots,
+                incoming_slot_values=incoming_slot_values,
+            )
         )
         if interpretation_type == "confirmation":
             _validate_confirmation_response_inputs(
@@ -1738,12 +1784,55 @@ def _validate_confirmation_response_inputs(
         raise ValueError("confirmation patch requires confirmation_signal accepted or rejected")
 
 
-def _mock_interpretation_from_user_patch(event: Mapping[str, Any]) -> tuple[str, bool, str]:
+def _mock_interpretation_from_user_patch(
+    event: Mapping[str, Any],
+    *,
+    current_resolved_slots: Mapping[str, str] | None = None,
+    incoming_slot_values: Mapping[str, str] | None = None,
+) -> tuple[str, bool, str]:
     candidate_types = _string_tuple(event.get("candidate_patch_types", ()))
     for candidate_type in ("cancel_candidate", "switch_task_candidate", "confirmation_candidate"):
         if candidate_type in candidate_types:
             interpretation_type, reason = CONTROL_PATCH_INTERPRETATIONS[candidate_type]
             return interpretation_type, False, reason
+
+    # A candidate type is only a Router/Thinker hypothesis.  When the
+    # Workbench provides the current resolved slots and the newly extracted
+    # slot values, SlowTask owns the semantic diff: filling a missing field
+    # makes the current plan executable but does not replace that plan.
+    # Replacing an established value does require a new plan_version.
+    if current_resolved_slots is not None and incoming_slot_values:
+        changed_fields = tuple(
+            field
+            for field, incoming_value in incoming_slot_values.items()
+            if current_resolved_slots.get(field) not in (None, "")
+            and _normalized_slot_value(current_resolved_slots[field])
+            != _normalized_slot_value(incoming_value)
+            and not _is_slot_refinement(
+                field=field,
+                current_value=current_resolved_slots[field],
+                incoming_value=incoming_value,
+            )
+        )
+        if changed_fields:
+            return (
+                "constraint_update",
+                True,
+                "established_slot_values_replaced:" + ",".join(changed_fields),
+            )
+        newly_resolved_fields = tuple(
+            field
+            for field, incoming_value in incoming_slot_values.items()
+            if incoming_value not in (None, "") and current_resolved_slots.get(field) in (None, "")
+        )
+        if newly_resolved_fields:
+            return (
+                "slot_update",
+                False,
+                "previously_unresolved_slots_filled:" + ",".join(newly_resolved_fields),
+            )
+        return "slot_update", False, "incoming_slot_values_equivalent_to_current_plan"
+
     for candidate_type, (interpretation_type, reason) in MATERIAL_PATCH_CANDIDATES.items():
         if candidate_type in candidate_types:
             return interpretation_type, True, reason
@@ -1751,6 +1840,35 @@ def _mock_interpretation_from_user_patch(event: Mapping[str, Any]) -> tuple[str,
         if candidate_type in candidate_types:
             return interpretation_type, False, reason
     return "irrelevant", False, "mock_no_material_candidate"
+
+
+def _normalized_slot_value(value: object) -> str:
+    """Compare compact slot values without treating formatting as a revision."""
+
+    return "".join(str(value).lower().split()).replace("，", "").replace("。", "")
+
+
+def _is_slot_refinement(*, field: str, current_value: object, incoming_value: object) -> bool:
+    """Return true when a vague meal period is narrowed, not replaced.
+
+    The Workbench slot extractor intentionally accepts “午饭/晚饭” as a
+    usable broad time window.  A later 12:00 or 18:30 therefore refines the
+    same meal period; it must not be mistaken for a user reversing an already
+    settled constraint.  A cross-period change such as lunch to evening is
+    still material and advances plan_version.
+    """
+
+    if field != "time_window":
+        return False
+    current = _normalized_slot_value(current_value)
+    incoming = _normalized_slot_value(incoming_value)
+    hour_match = re.search(r"(\d{1,2}):\d{2}", incoming)
+    if hour_match is None:
+        return False
+    hour = int(hour_match.group(1))
+    is_lunch_period = any(marker in current for marker in ("午饭", "午餐", "中午"))
+    is_dinner_period = any(marker in current for marker in ("晚饭", "晚餐", "晚上"))
+    return (is_lunch_period and 10 <= hour < 16) or (is_dinner_period and 16 <= hour <= 23)
 
 
 def _source_evidence_refs_from_user_patch(event: Mapping[str, Any]) -> tuple[str, ...]:

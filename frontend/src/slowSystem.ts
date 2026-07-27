@@ -106,6 +106,8 @@ export type SlowTaskSnapshot = Readonly<{
   currentPlanVersion: PlanVersionReadOnly;
   currentTaskEventSeq: TaskEventSeqReadOnly;
   planVersions: readonly PlanVersionSnapshot[];
+  missingFields: readonly string[];
+  conflictingFields: readonly string[];
   pendingConfirmation?: PendingConfirmation;
   semanticCommitmentStatus: "not_emitted_yet" | "emitted_by_slowtask";
   staleEvidencePolicy: string;
@@ -304,6 +306,14 @@ export type WorkbenchProgressWire = Readonly<{
   detail?: string | null;
   phase?: string | null;
   label?: string | null;
+  orchestration_role?: string | null;
+  subtask_id?: string | null;
+  subtask_goal?: string | null;
+  public_thought?: string | null;
+  tool_input_summary?: string | null;
+  tool_output_summary?: string | null;
+  next_step?: string | null;
+  blocked_on_user?: boolean | null;
 }>;
 
 export type WorkbenchStreamingWire = Readonly<{

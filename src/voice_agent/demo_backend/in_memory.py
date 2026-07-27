@@ -535,12 +535,8 @@ class InMemoryDemoBackend:
                         "label": "Synthetic Riverside Meeting Hotel",
                         "distance_band": "near_company",
                     },
-                    {
-                        "option_ref": f"option://synthetic/{opaque_result_id}/central-a",
-                        "label": "Synthetic Central Station Hotel",
-                        "distance_band": "short_transit",
-                    },
                 ],
+                "fixture_disclosure": "synthetic_demo_fixture",
                 "source": "in_memory_demo_backend",
             },
         )

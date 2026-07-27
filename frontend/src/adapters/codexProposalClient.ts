@@ -113,7 +113,17 @@ export async function requestCodexProposal({
   if (!currentSnapshot) {
     currentSnapshot = await getWorkbenchSnapshot(resolvedSessionId);
   }
-  if (action && action !== "start_new_task" && action !== "foreground_chat" && !hasActiveTask(currentSnapshot)) {
+  // Cancellation is meaningful only for an existing active SlowTask.  Do not
+  // manufacture an unrelated bootstrap task merely so a cancellation demo can
+  // show a confirmation gate; the backend returns a truthful no-active-task
+  // answer instead.
+  if (
+    action
+    && action !== "start_new_task"
+    && action !== "foreground_chat"
+    && action !== "request_cancel_confirmation"
+    && !hasActiveTask(currentSnapshot)
+  ) {
     const bootstrap = await sendWorkbenchMessage(
       resolvedSessionId,
       "帮我规划一个两天的客户来访行程，地点尽量靠近公司。",
@@ -404,6 +414,8 @@ export function workbenchSnapshotToScenario(
       currentPlanVersion: readonlyPlanVersion(currentPlanVersion),
       currentTaskEventSeq: readonlyTaskEventSeq(currentTaskEventSeq),
       planVersions: planVersions.length > 0 ? planVersions : baseScenario.slowTask.planVersions,
+      missingFields: task?.missing_fields ?? baseScenario.slowTask.missingFields,
+      conflictingFields: task?.conflicting_fields ?? baseScenario.slowTask.conflictingFields,
       pendingConfirmation,
       semanticCommitmentStatus,
       staleEvidencePolicy: task?.stale_evidence_policy ?? baseScenario.slowTask.staleEvidencePolicy,

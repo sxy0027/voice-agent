@@ -84,7 +84,7 @@ export function ConversationPanel({
             <small>{turn.note}</small>
           </article>
         ))}
-        <CodexProgressFeed scenario={runScenario} loading={loading} />
+        <CodexProgressFeed scenario={runScenario} loading={loading} hasRun={hasRun} />
         <CodexAnswerTurn proposal={proposal} loading={loading} error={proposalError} />
       </div>
 
@@ -101,8 +101,8 @@ export function ConversationPanel({
         />
         <div className="composer-actions">
           <span data-match={matchedBy}>matched_by: {hasRun ? matchedBy : "not_run"}</span>
-          <button className="run-button" type="button" disabled={loading} onClick={onRunMockInput}>
-            {loading ? "Running Router + Codex..." : "Send message"}
+          <button className="run-button" type="button" onClick={onRunMockInput}>
+            {loading ? "Send correction / interrupt" : "Send message"}
           </button>
         </div>
       </div>

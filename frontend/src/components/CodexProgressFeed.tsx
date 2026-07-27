@@ -1,14 +1,17 @@
 import type { SlowSystemScenario, WorkbenchProgressWire } from "../slowSystem";
 
+type ProgressDetail = readonly [string, string];
+
 type CodexProgressFeedProps = Readonly<{
   scenario: SlowSystemScenario;
   loading: boolean;
+  hasRun: boolean;
 }>;
 
-export function CodexProgressFeed({ scenario, loading }: CodexProgressFeedProps) {
+export function CodexProgressFeed({ scenario, loading, hasRun }: CodexProgressFeedProps) {
   const progress = scenario.liveProgress.slice(-14);
   const streaming = scenario.streaming;
-  const visible = loading || progress.length > 0;
+  const visible = hasRun && (loading || progress.length > 0);
 
   if (!visible) {
     return null;
@@ -23,8 +26,8 @@ export function CodexProgressFeed({ scenario, loading }: CodexProgressFeedProps)
     >
       <div className="live-progress-heading">
         <div>
-          <p className="panel-kicker">Live execution</p>
-          <h3 id="live-progress-heading">Codex 执行进度</h3>
+          <p className="panel-kicker">公开执行记录</p>
+          <h3 id="live-progress-heading">Codex 执行过程</h3>
         </div>
         <span className="live-progress-state">
           <span className="live-progress-dot" aria-hidden="true" />
@@ -48,7 +51,7 @@ export function CodexProgressFeed({ scenario, loading }: CodexProgressFeedProps)
       )}
 
       <small className="live-progress-safety">
-        这里显示的是 allow-listed 的阶段、工具名称和校验状态；不会展示隐藏思维、原始 provider body 或凭据。
+        这里按顺序展示可审计的阶段、工具名称、输入/输出摘要与下一步；不会展示隐藏思维链、原始 provider body 或凭据。
       </small>
     </section>
   );
@@ -56,7 +59,20 @@ export function CodexProgressFeed({ scenario, loading }: CodexProgressFeedProps)
 
 function ProgressRow({ item }: Readonly<{ item: WorkbenchProgressWire }>) {
   const label = item.label || fallbackLabel(item.kind);
-  const metadata = [item.phase, item.status, item.tool_name ? `tool=${item.tool_name}` : null].filter(Boolean);
+  const metadata = [
+    item.phase,
+    item.status,
+    item.orchestration_role ? `role=${item.orchestration_role}` : null,
+    item.subtask_id ? `subtask=${item.subtask_id}` : null,
+    item.tool_name ? `tool=${item.tool_name}` : null,
+    item.blocked_on_user ? "blocked_on_user=true" : null,
+  ].filter(Boolean);
+  const expanded: ProgressDetail[] = [];
+  if (item.subtask_goal) expanded.push(["目标", item.subtask_goal]);
+  if (item.public_thought) expanded.push(["公开执行摘要", item.public_thought]);
+  if (item.tool_input_summary) expanded.push(["工具输入", item.tool_input_summary]);
+  if (item.tool_output_summary) expanded.push(["工具输出", item.tool_output_summary]);
+  if (item.next_step) expanded.push(["下一步", item.next_step]);
   return (
     <li className="live-progress-item">
       <span className="live-progress-index">{String(item.sequence).padStart(2, "0")}</span>
@@ -64,6 +80,16 @@ function ProgressRow({ item }: Readonly<{ item: WorkbenchProgressWire }>) {
         <strong>{label}</strong>
         <span className="live-progress-meta">{metadata.join(" · ")}</span>
         {item.detail ? <small>{item.detail}</small> : null}
+        {expanded.length > 0 ? (
+          <dl className="live-progress-details">
+            {expanded.map(([name, value]) => (
+              <div key={name}>
+                <dt>{name}</dt>
+                <dd>{value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
       </span>
     </li>
   );

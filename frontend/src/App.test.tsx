@@ -21,6 +21,7 @@ describe("App", () => {
     expect(screen.getByText(/这是一个连续会话 demo/)).toBeTruthy();
     expect(screen.getByText("Request backend proposal")).toBeTruthy();
     expect(screen.getByText("No Codex result yet")).toBeTruthy();
+    expect(screen.queryByText("Codex 执行过程")).toBeNull();
     expect((screen.getByLabelText("Provider") as HTMLSelectElement).value).toBe(
       "codex_cli_local",
     );
