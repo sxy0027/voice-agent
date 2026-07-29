@@ -981,7 +981,7 @@ def _fake_structured_output(
                 + "、".join(USER_FACING_FIELD_LABELS.get(field, field) for field in normalized_missing)
                 + "。请直接提供这些信息，我会据此继续处理。"
                 if normalized_missing
-                else "为 synthetic company fixture 生成靠近公司的两天行程候选。"
+                else "信息已经足够。我会先按当前时间、地点和偏好准备候选方案；这些候选只用于演示和后续确认，不会自动预订或外发。"
             ),
             "intent": "clarify_missing_slots" if normalized_missing else "complex_itinerary_planning",
             "confidence": "medium" if normalized_missing else "high",

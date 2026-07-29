@@ -46,6 +46,13 @@ def test_python_owned_session_starts_dynamic_tool_phase_with_fake_codex() -> Non
         assert snapshot["capability_matrices"][-1]["output_mode"] == "mock"
         assert snapshot["provider_trace"][-1]["output_mode"] == "fallback"
         assert snapshot["safety"]["raw_provider_body_included"] is False
+        user_visible_reply = snapshot["conversation"][-1]["text"]
+        proposal_summary = snapshot["codex_proposals"][-1]["summary"]
+        assert "信息已经足够" in user_visible_reply
+        assert "信息已经足够" in proposal_summary
+        assert "synthetic company fixture" not in user_visible_reply
+        assert "fixture" not in user_visible_reply
+        assert "行程候选" not in user_visible_reply
 
     asyncio.run(scenario())
 
