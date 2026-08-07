@@ -75,6 +75,7 @@ def test_python_owned_session_waits_for_user_when_critical_slots_are_missing() -
         assert snapshot["task"]["missing_fields"] == ["time_window"]
         assert snapshot["task"]["in_flight_tool_calls"] == []
         assert snapshot["codex_proposals"][-1]["proposal_type"] == "clarification"
+        assert snapshot["codex_proposals"][-1]["known_fields"] == ["location_anchor"]
         assert snapshot["codex_proposals"][-1]["missing_fields"] == ["time_window"]
         assert any(item.get("blocked_on_user") is True for item in snapshot["live_progress"])
         assert "用餐日期与具体时段" in result["snapshot"]["conversation"][-1]["text"]
@@ -106,6 +107,10 @@ def test_workbench_remembers_user_supplied_slots_across_turns() -> None:
         assert supplied_snapshot["task"]["current_plan_version"] == 1
         assert supplied_snapshot["task"]["missing_fields"] == []
         assert supplied_snapshot["task"]["in_flight_tool_calls"]
+        assert set(supplied_snapshot["codex_proposals"][-1]["known_fields"]) >= {
+            "location_anchor",
+            "time_window",
+        }
         assert supplied_snapshot["codex_proposals"][-1]["missing_fields"] == []
         assert supplied_snapshot["conversation"][-1]["text"] == supplied_snapshot["codex_proposals"][-1]["summary"]
 
@@ -183,11 +188,32 @@ def test_filling_missing_slots_keeps_v1_then_replacing_time_advances_to_v2() -> 
 def test_workbench_environment_defaults_to_local_codex_cli(monkeypatch) -> None:
     monkeypatch.delenv("VOICE_AGENT_WORKBENCH_CODEX_MODE", raising=False)
     monkeypatch.delenv("VOICE_AGENT_ALLOW_LOCAL_CODEX_CLI", raising=False)
+    monkeypatch.delenv("VOICE_AGENT_CODEX_MODEL", raising=False)
+    monkeypatch.delenv("VOICE_AGENT_CODEX_REASONING_EFFORT", raising=False)
 
     config = WorkbenchRuntimeConfig.from_environment()
 
     assert config.provider_mode == "codex_cli_local"
     assert config.allow_local_codex_cli is True
+    assert config.model_name == "5.5"
+    assert config.reasoning_effort == "high"
+
+
+def test_workbench_environment_allows_codex_model_override(monkeypatch) -> None:
+    monkeypatch.setenv("VOICE_AGENT_CODEX_MODEL", "custom-local-model")
+    monkeypatch.setenv("VOICE_AGENT_CODEX_REASONING_EFFORT", "medium")
+
+    config = WorkbenchRuntimeConfig.from_environment()
+
+    assert config.model_name == "custom-local-model"
+    assert config.reasoning_effort == "medium"
+
+
+def test_workbench_mapping_defaults_to_55_high() -> None:
+    config = WorkbenchRuntimeConfig.from_mapping({})
+
+    assert config.model_name == "5.5"
+    assert config.reasoning_effort == "high"
 
 
 def test_local_codex_cli_passes_output_schema_as_short_lived_file(monkeypatch) -> None:
@@ -230,6 +256,40 @@ def test_local_codex_cli_passes_output_schema_as_short_lived_file(monkeypatch) -
     assert not schema_path.exists()
     assert stdout == '{"type":"turn.completed"}\n'
     assert stderr == ""
+
+
+def test_local_codex_cli_passes_model_and_reasoning_effort(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, prompt: bytes) -> tuple[bytes, bytes]:
+            captured["prompt"] = prompt.decode("utf-8")
+            return b'{"type":"turn.completed"}\n', b""
+
+    async def fake_create_subprocess_exec(*command: str, **_kwargs: object) -> FakeProcess:
+        captured["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(codex_slow_llm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    asyncio.run(
+        _run_codex_cli_async(
+            CodexSlowLLMAdapterConfig(
+                provider_mode="codex_cli_local",
+                allow_local_codex_cli=True,
+                model_name="5.5",
+                reasoning_effort="high",
+            ),
+            "Return one structured proposal.",
+        )
+    )
+
+    command = captured["command"]
+    assert isinstance(command, tuple)
+    assert command[command.index("--model") + 1] == "5.5"
+    assert ("-c", "model_reasoning_effort=high") in zip(command, command[1:])
 
 
 def test_codex_jsonl_parser_extracts_item_completed_text() -> None:
@@ -372,6 +432,7 @@ def test_codex_proposal_projection_uses_validated_model_analysis() -> None:
             },
             "tool_proposal": {"tool_name": "demo.itinerary.search"},
             "confirmation_risk_hints": ["只使用 synthetic demo sandbox。"],
+            "known_fields": ["location_anchor", "time_window"],
             "missing_fields": [],
         },
         source_evidence_refs=("evidence://synthetic/user/request",),
@@ -383,6 +444,31 @@ def test_codex_proposal_projection_uses_validated_model_analysis() -> None:
     assert any("上午时间窗" in step for step in proposal["suggested_next_steps"])
     assert not any("Codex intent classification" in step for step in proposal["suggested_next_steps"])
     assert any("synthetic demo sandbox" in note for note in proposal["risk_notes"])
+    assert proposal["known_fields"] == ["location_anchor", "time_window"]
+
+
+def test_codex_proposal_projection_keeps_model_gap_analysis_separate_from_state_hint() -> None:
+    proposal = _proposal_from_structured_output(
+        {
+            "task_binding": {"adapter_request_id": "request_model_gap_analysis"},
+            "task_analysis": {
+                "summary": "我看到地点已经有了，但人数还没说清楚。",
+                "intent": "clarify_model_detected_gap",
+            },
+            "tool_proposal": {"tool_name": "demo.itinerary.search"},
+            "confirmation_risk_hints": [],
+            "known_fields": ["location_anchor"],
+            "missing_fields": ["party_size"],
+        },
+        source_evidence_refs=("evidence://synthetic/user/request",),
+        provider_mode="codex_cli_local",
+        output_mode="real",
+        state_missing_fields=("time_window",),
+    )
+
+    assert proposal["known_fields"] == ["location_anchor"]
+    assert proposal["missing_fields"] == ["party_size"]
+    assert any("后端当前状态" in note for note in proposal["risk_notes"])
 
 
 def test_material_patch_advances_plan_and_late_tool_result_is_stale() -> None:

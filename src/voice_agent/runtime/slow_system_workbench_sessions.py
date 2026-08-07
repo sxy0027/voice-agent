@@ -64,6 +64,8 @@ WORKBENCH_CAPABILITY_SNAPSHOT_REF = "capability://workbench/slow-system-v1"
 WORKBENCH_CAPABILITY_VERSION = "workbench.slow-system.v1"
 WORKBENCH_DEFAULT_PROVIDER_MODE = "codex_cli_local"
 WORKBENCH_DEFAULT_ALLOW_LOCAL_CODEX_CLI = True
+WORKBENCH_DEFAULT_CODEX_MODEL = "5.5"
+WORKBENCH_DEFAULT_CODEX_REASONING_EFFORT = "high"
 SAFE_TEXT_MAX_LENGTH = 1200
 SAFE_SUMMARY_MAX_LENGTH = 320
 _SAFE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_.:/-]+$")
@@ -81,8 +83,8 @@ class WorkbenchRuntimeConfig:
     allow_local_codex_cli: bool = WORKBENCH_DEFAULT_ALLOW_LOCAL_CODEX_CLI
     codex_bin: str = "codex"
     timeout_seconds: int = 30
-    model_name: str | None = None
-    reasoning_effort: str | None = None
+    model_name: str | None = WORKBENCH_DEFAULT_CODEX_MODEL
+    reasoning_effort: str | None = WORKBENCH_DEFAULT_CODEX_REASONING_EFFORT
     max_repair_attempts: int = 2
 
     @classmethod
@@ -91,8 +93,11 @@ class WorkbenchRuntimeConfig:
         provider_mode = str(value.get("provider_mode", WORKBENCH_DEFAULT_PROVIDER_MODE))
         if provider_mode not in CODEX_PROVIDER_MODES:
             raise ValueError(f"provider_mode must be one of {sorted(CODEX_PROVIDER_MODES)}")
-        model_name = value.get("model_name")
-        reasoning_effort = value.get("reasoning_effort")
+        model_name = value.get("model_name", WORKBENCH_DEFAULT_CODEX_MODEL)
+        reasoning_effort = value.get(
+            "reasoning_effort",
+            WORKBENCH_DEFAULT_CODEX_REASONING_EFFORT,
+        )
         return cls(
             provider_mode=provider_mode,
             allow_local_codex_cli=bool(
@@ -125,8 +130,11 @@ class WorkbenchRuntimeConfig:
                 "allow_local_codex_cli": allow,
                 "codex_bin": os.environ.get("VOICE_AGENT_CODEX_BIN", "codex"),
                 "timeout_seconds": os.environ.get("VOICE_AGENT_CODEX_TIMEOUT_SECONDS", "30"),
-                "model_name": os.environ.get("VOICE_AGENT_CODEX_MODEL"),
-                "reasoning_effort": os.environ.get("VOICE_AGENT_CODEX_REASONING_EFFORT"),
+                "model_name": os.environ.get("VOICE_AGENT_CODEX_MODEL", WORKBENCH_DEFAULT_CODEX_MODEL),
+                "reasoning_effort": os.environ.get(
+                    "VOICE_AGENT_CODEX_REASONING_EFFORT",
+                    WORKBENCH_DEFAULT_CODEX_REASONING_EFFORT,
+                ),
             }
         )
 
@@ -601,7 +609,7 @@ class WorkbenchSession:
                 intent=text,
                 slowtask_event=evidence_reviewed_event,
                 source_evidence_refs=(evidence_ref,),
-                authoritative_missing_fields=missing_slots,
+                state_missing_fields_hint=missing_slots,
             )
             self._codex_proposals.append(provider_result.proposal)
             codex_ref = self._next_ref("evidence", "codex")
@@ -622,7 +630,7 @@ class WorkbenchSession:
             intent=text,
             slowtask_event=planning_event,
             source_evidence_refs=(evidence_ref,),
-            authoritative_missing_fields=(),
+            state_missing_fields_hint=(),
         )
         codex_ref = self._next_ref("evidence", "codex")
         self._record_evidence(
@@ -756,7 +764,7 @@ class WorkbenchSession:
                     intent=text,
                     slowtask_event=resumed.produced_events[0],
                     source_evidence_refs=(evidence_ref,),
-                    authoritative_missing_fields=(),
+                    state_missing_fields_hint=(),
                 )
                 self._codex_proposals.append(provider_result.proposal)
                 codex_ref = self._next_ref("evidence", "codex")
@@ -788,7 +796,7 @@ class WorkbenchSession:
             intent=text,
             slowtask_event=restarted,
             source_evidence_refs=(evidence_ref,),
-            authoritative_missing_fields=missing_slots,
+            state_missing_fields_hint=missing_slots,
         )
         self._codex_proposals.append(provider_result.proposal)
         codex_ref = self._next_ref("evidence", "codex")
@@ -1345,7 +1353,7 @@ class WorkbenchSession:
         intent: str,
         slowtask_event: Mapping[str, Any],
         source_evidence_refs: Sequence[str],
-        authoritative_missing_fields: Sequence[str] | None = None,
+        state_missing_fields_hint: Sequence[str] | None = None,
     ) -> Any:
         context = self._context_pack().to_dict()
         start_mono, start_wall = self._clock.reserve()
@@ -1362,7 +1370,7 @@ class WorkbenchSession:
             intent=intent,
             slowtask_event=slowtask_event,
             source_evidence_refs=source_evidence_refs,
-            authoritative_missing_fields=authoritative_missing_fields,
+            state_missing_fields_hint=state_missing_fields_hint,
             event_id_prefix=self._next_id("codex"),
             created_monotonic_ms=start_mono,
             created_wall_clock_ms=start_wall,

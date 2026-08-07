@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Any
@@ -44,7 +45,7 @@ WORKBENCH_PROPOSABLE_TOOL_NAMES = frozenset(
         "demo.itinerary.preview",
     }
 )
-WORKBENCH_AUTHORITATIVE_MISSING_FIELDS = frozenset(
+WORKBENCH_SAFE_FIELD_NAMES = frozenset(
     {
         "time_window",
         "location_anchor",
@@ -56,6 +57,7 @@ WORKBENCH_AUTHORITATIVE_MISSING_FIELDS = frozenset(
         "parking_needed",
     }
 )
+WORKBENCH_REQUIRED_PLANNING_FIELDS = ("location_anchor", "time_window")
 USER_FACING_FIELD_LABELS = {
     "time_window": "用餐日期与具体时段",
     "location_anchor": "明确的位置锚点",
@@ -255,7 +257,7 @@ class CodexSlowLLMAdapter:
         intent: str,
         slowtask_event: Mapping[str, Any],
         source_evidence_refs: Sequence[str],
-        authoritative_missing_fields: Sequence[str] | None = None,
+        state_missing_fields_hint: Sequence[str] | None = None,
         event_id_prefix: str,
         created_monotonic_ms: int,
         created_wall_clock_ms: int,
@@ -291,11 +293,17 @@ class CodexSlowLLMAdapter:
         trace_items.append(started_trace)
         await _emit_provider_progress(on_progress, started_trace)
         missing_source = (
-            authoritative_missing_fields
-            if authoritative_missing_fields is not None
+            state_missing_fields_hint
+            if state_missing_fields_hint is not None
             else task_context_pack.get("missing_fields", ())
         )
-        public_missing_fields = _normalize_missing_fields(missing_source)
+        state_missing_fields = _normalize_missing_fields(missing_source)
+        inferred_known_fields = _infer_known_fields_from_context(task_context_pack)
+        inferred_missing_fields = _infer_missing_fields_from_context(
+            task_context_pack,
+            known_fields=inferred_known_fields,
+            state_missing_hint=state_missing_fields,
+        )
         context_trace = _trace_item(
             sequence=len(trace_items) + 1,
             kind="main_thread_context_loaded",
@@ -315,7 +323,7 @@ class CodexSlowLLMAdapter:
         gap_trace = _trace_item(
             sequence=len(trace_items) + 1,
             kind="subtask_completed",
-            status="blocked_on_user" if public_missing_fields else "completed",
+            status="blocked_on_user" if state_missing_fields else "completed",
             provider_mode=self._config.provider_mode,
             output_mode=self.capability["output_mode"],
             task_id=task_id,
@@ -324,16 +332,16 @@ class CodexSlowLLMAdapter:
             subtask_id="slot_gap_analysis",
             subtask_goal="检查时间、地点等执行前必须确认的信息是否完整。",
             public_thought=(
-                f"还缺 {', '.join(public_missing_fields)}，需要用户补充后再继续。"
-                if public_missing_fields
+                f"后端当前状态仍缺 {', '.join(state_missing_fields)}，因此不会启动工具。"
+                if state_missing_fields
                 else "关键槽位已满足，可以进入工具候选审查。"
             ),
-            next_step="等待用户补充" if public_missing_fields else "审查 demo 工具候选",
-            blocked_on_user=bool(public_missing_fields),
+            next_step="等待用户补充" if state_missing_fields else "审查 demo 工具候选",
+            blocked_on_user=bool(state_missing_fields),
         )
         trace_items.append(gap_trace)
         await _emit_provider_progress(on_progress, gap_trace)
-        if not public_missing_fields:
+        if not state_missing_fields:
             tool_review_trace = _trace_item(
                 sequence=len(trace_items) + 1,
                 kind="subtask_started",
@@ -371,7 +379,8 @@ class CodexSlowLLMAdapter:
                 binding=binding,
                 source_evidence_refs=source_evidence_refs,
                 intent=intent,
-                missing_fields=public_missing_fields,
+                known_fields=inferred_known_fields,
+                missing_fields=inferred_missing_fields,
                 output_mode="fallback",
             )
             trace_items.append(
@@ -386,7 +395,7 @@ class CodexSlowLLMAdapter:
                     proposal_only=True,
                     orchestration_role="main_thread",
                     public_thought="fake provider 生成了稳定的 proposal 候选，用于无 credential 演示。",
-                    blocked_on_user=bool(public_missing_fields),
+                    blocked_on_user=bool(state_missing_fields),
                 )
             )
         elif self._config.provider_mode == "codex_cli_local" and self._config.allow_local_codex_cli:
@@ -493,7 +502,8 @@ class CodexSlowLLMAdapter:
                 binding=binding,
                 source_evidence_refs=source_evidence_refs,
                 intent=intent,
-                missing_fields=public_missing_fields,
+                known_fields=inferred_known_fields,
+                missing_fields=inferred_missing_fields,
                 output_mode="degraded",
             )
 
@@ -529,7 +539,8 @@ class CodexSlowLLMAdapter:
                     binding=binding,
                     source_evidence_refs=source_evidence_refs,
                     intent=intent,
-                    missing_fields=public_missing_fields,
+                    known_fields=inferred_known_fields,
+                    missing_fields=inferred_missing_fields,
                     output_mode="degraded",
                 ),
                 expected_binding=binding,
@@ -591,7 +602,7 @@ class CodexSlowLLMAdapter:
             source_evidence_refs=source_evidence_refs,
             provider_mode=provider_mode,
             output_mode=output_mode,
-            authoritative_missing_fields=public_missing_fields,
+            state_missing_fields=state_missing_fields,
         )
         structured_trace = _trace_item(
             sequence=len(trace_items) + 1,
@@ -962,10 +973,12 @@ def _fake_structured_output(
     binding: QwenSlowLLMRequestBinding,
     source_evidence_refs: Sequence[str],
     intent: str,
+    known_fields: Sequence[str] = (),
     missing_fields: Sequence[str] = (),
     output_mode: str,
 ) -> dict[str, Any]:
-    normalized_missing = tuple(_safe_provider_label(str(field)) for field in missing_fields if str(field))
+    normalized_known = _normalize_field_list(known_fields)
+    normalized_missing = _normalize_missing_fields(missing_fields)
     args_status = "partial" if normalized_missing else "candidate_ready"
     tool_args = {
         "company_location": "Synthetic Central Office",
@@ -986,6 +999,7 @@ def _fake_structured_output(
             "intent": "clarify_missing_slots" if normalized_missing else "complex_itinerary_planning",
             "confidence": "medium" if normalized_missing else "high",
         },
+        "known_fields": list(normalized_known),
         "missing_fields": list(normalized_missing),
         "conflicting_fields": [],
         "proposed_resolved_arguments_evidence": {
@@ -1029,7 +1043,7 @@ def _proposal_from_structured_output(
     source_evidence_refs: Sequence[str],
     provider_mode: str,
     output_mode: str,
-    authoritative_missing_fields: Sequence[str] | None = None,
+    state_missing_fields: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     task_analysis = output.get("task_analysis")
     analysis_summary = _bounded_model_text(
@@ -1037,11 +1051,9 @@ def _proposal_from_structured_output(
         fallback="Codex 返回了一个经过 schema 校验的任务分析候选。",
     )
     tool_proposal = output["tool_proposal"]
-    missing_fields = _normalize_missing_fields(
-        authoritative_missing_fields
-        if authoritative_missing_fields is not None
-        else output.get("missing_fields", [])
-    )
+    known_fields = _normalize_field_list(output.get("known_fields", []))
+    missing_fields = _normalize_missing_fields(output.get("missing_fields", []))
+    normalized_state_missing_fields = _normalize_missing_fields(state_missing_fields or ())
     candidate_tool_name = str(tool_proposal.get("tool_name", "demo.itinerary.search"))
     tool_name = (
         candidate_tool_name
@@ -1053,6 +1065,10 @@ def _proposal_from_structured_output(
         safe_hint = _bounded_model_text(item, fallback="")
         if safe_hint:
             risk_hints.append(safe_hint)
+    if set(normalized_state_missing_fields) != set(missing_fields):
+        risk_hints.append(
+            "Codex 对缺失信息的判断与后端当前状态不完全一致；展示时以 proposal 为候选，是否推进仍以后端状态为准。"
+        )
     if missing_fields:
         readable_missing_fields = "、".join(
             USER_FACING_FIELD_LABELS.get(field, field) for field in missing_fields
@@ -1083,6 +1099,7 @@ def _proposal_from_structured_output(
         # or authorize a tool.
         "summary": analysis_summary,
         "suggested_next_steps": suggested_next_steps,
+        "known_fields": list(known_fields),
         "missing_fields": list(missing_fields),
         "requires_confirmation": False,
         "risk_notes": [
@@ -1131,16 +1148,140 @@ def _bounded_model_text(value: object, *, fallback: str, max_length: int = 320) 
 
 
 def _normalize_missing_fields(value: object) -> tuple[str, ...]:
+    return _normalize_field_list(value)
+
+
+def _normalize_field_list(value: object) -> tuple[str, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         return ()
     result: list[str] = []
     for item in value:
         field = _safe_provider_label(str(item))
-        if field not in WORKBENCH_AUTHORITATIVE_MISSING_FIELDS:
+        if field not in WORKBENCH_SAFE_FIELD_NAMES:
             continue
         if field not in result:
             result.append(field)
     return tuple(result)
+
+
+def _infer_missing_fields_from_context(
+    task_context_pack: Mapping[str, Any],
+    *,
+    known_fields: Sequence[str],
+    state_missing_hint: Sequence[str],
+) -> tuple[str, ...]:
+    """Infer the fake provider's missing-field proposal from visible context.
+
+    The real Codex path returns its own structured ``missing_fields``.  The
+    fake provider has no model, so it uses small, transparent text cues from
+    the bounded context pack.  ``state_missing_hint`` is only a fallback for
+    sparse synthetic fixtures; it is not used later to overwrite provider
+    output.
+    """
+
+    known = set(_normalize_field_list(known_fields))
+    inferred = tuple(field for field in WORKBENCH_REQUIRED_PLANNING_FIELDS if field not in known)
+    if known:
+        return inferred
+    return _normalize_missing_fields(state_missing_hint) or inferred
+
+
+def _infer_known_fields_from_context(task_context_pack: Mapping[str, Any]) -> tuple[str, ...]:
+    text = _context_text_for_field_inference(task_context_pack)
+    lowered = text.lower()
+    known: list[str] = []
+
+    def add(field: str) -> None:
+        if field in WORKBENCH_SAFE_FIELD_NAMES and field not in known:
+            known.append(field)
+
+    if any(
+        marker in text
+        for marker in (
+            "公司",
+            "办公室",
+            "园区",
+            "酒店",
+            "机场",
+            "车站",
+            "餐厅",
+            "会议室",
+            "地点",
+            "附近",
+            "位置",
+            "中关村",
+            "领展",
+            "欧美汇",
+            "丹棱街",
+            "北京",
+        )
+    ) or any(marker in lowered for marker in ("office", "hotel", "airport", "station", "near")):
+        add("location_anchor")
+    if (
+        any(
+            marker in text
+            for marker in (
+                "今天",
+                "明天",
+                "后天",
+                "上午",
+                "下午",
+                "晚上",
+                "中午",
+                "午饭",
+                "午餐",
+                "晚饭",
+                "晚餐",
+                "周一",
+                "周二",
+                "周三",
+                "周四",
+                "周五",
+                "周六",
+                "周日",
+            )
+        )
+        or any(marker in lowered for marker in ("today", "tomorrow", "morning", "afternoon", "evening", "lunch", "dinner"))
+        or re.search(r"\d{1,2}\s*[点:：]\s*(半|\d{1,2})?", text)
+        or re.search(r"\d{1,2}月\d{1,2}[号日]?", text)
+    ):
+        add("time_window")
+    if re.search(r"(\d+|[一二三四五六七八九十两]+)\s*个?人", text):
+        add("party_size")
+    if re.search(r"(人均\s*)?\d+\s*(元|块|以内|以下)", text):
+        add("budget")
+    if any(marker in text for marker in ("不吃辣", "忌口", "过敏", "清淡", "素食", "没有其他忌口")):
+        add("dietary_constraints")
+    if any(marker in text for marker in ("包间", "安静", "商务环境")):
+        add("private_room_or_quiet_space")
+    if "发票" in text:
+        add("invoice_needed")
+    if "停车" in text:
+        add("parking_needed")
+
+    return tuple(known)
+
+
+def _context_text_for_field_inference(task_context_pack: Mapping[str, Any]) -> str:
+    chunks: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, str):
+            chunks.append(value)
+        elif isinstance(value, Mapping):
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            for nested in value:
+                collect(nested)
+
+    collect(task_context_pack.get("current_goal"))
+    collect(task_context_pack.get("latest_user_input"))
+    collect(task_context_pack.get("current_constraints", []))
+    collect(task_context_pack.get("recent_interaction_summary", []))
+    collect(task_context_pack.get("accepted_evidence_summaries", []))
+    collect(task_context_pack.get("resolved_arguments", {}))
+    return " ".join(chunks)[:4000]
 
 
 def _build_codex_prompt(
@@ -1157,7 +1298,7 @@ def _build_codex_prompt(
         "current_goal": task_context_pack.get("current_goal"),
         "current_constraints": task_context_pack.get("current_constraints", []),
         "resolved_arguments": task_context_pack.get("resolved_arguments", {}),
-        "missing_fields": task_context_pack.get("missing_fields", []),
+        "backend_missing_hint": task_context_pack.get("missing_fields", []),
         "conflicting_fields": task_context_pack.get("conflicting_fields", []),
         "recent_interaction_summary": task_context_pack.get("recent_interaction_summary", []),
         "accepted_evidence_refs": task_context_pack.get("accepted_evidence_refs", []),
@@ -1173,8 +1314,10 @@ def _build_codex_prompt(
         "Write every user-visible summary, intent, and risk hint in clear Simplified Chinese. "
         "task_analysis.summary is a direct user-facing reply candidate, not hidden reasoning: "
         "acknowledge only constraints present in task_context, state only the current SlowTask status, "
-        "and give concrete next questions. When information is missing, ask for every and only field "
-        "listed in task_context.missing_fields using user language; never expose internal enum names. "
+        "and give concrete next questions. You must infer known_fields and missing_fields from "
+        "the visible user constraints, resolved arguments, evidence summaries, and recent interaction. "
+        "task_context.backend_missing_hint is only a backend state hint for comparison; do not copy it "
+        "blindly. When information is missing, ask using user language; never expose internal enum names. "
         "Do not invent restaurants, availability, prices, bookings, tool results, or completed actions.\n"
         + json.dumps(
             {
@@ -1222,6 +1365,7 @@ def _codex_output_schema_json() -> str:
                     "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
                 }
             ),
+            "known_fields": {"type": "array", "items": {"type": "string"}},
             "missing_fields": {"type": "array", "items": {"type": "string"}},
             "conflicting_fields": {"type": "array", "items": {"type": "string"}},
             "proposed_resolved_arguments_evidence": _strict_json_object(
