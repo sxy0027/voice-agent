@@ -99,6 +99,29 @@ export type PendingConfirmation = Readonly<{
   status: "pending" | "accepted_by_user" | "rejected_by_user";
 }>;
 
+export type SlotSummaryItem = Readonly<{
+  name: string;
+  label: string;
+  state: "UNKNOWN" | "CANDIDATE" | "RESOLVED" | "AMBIGUOUS" | "CONFLICTING" | "DEFAULTED";
+  valuePreview: string;
+  source: string;
+  requiredFor: readonly string[];
+  askedCount: number;
+}>;
+
+export type ReadinessSummary = Readonly<{
+  search: boolean;
+  plan: boolean;
+  commitment: boolean;
+}>;
+
+export type ClarificationSummary = Readonly<{
+  blockedStage: "search" | "plan" | "commitment";
+  askFields: readonly string[];
+  reason: "missing" | "ambiguous" | "conflicting";
+  attempt: number;
+}>;
+
 export type SlowTaskSnapshot = Readonly<{
   taskId: string;
   owner: "slowtask";
@@ -108,6 +131,9 @@ export type SlowTaskSnapshot = Readonly<{
   planVersions: readonly PlanVersionSnapshot[];
   missingFields: readonly string[];
   conflictingFields: readonly string[];
+  slotSummary?: readonly SlotSummaryItem[];
+  readiness?: ReadinessSummary;
+  clarification?: ClarificationSummary;
   pendingConfirmation?: PendingConfirmation;
   semanticCommitmentStatus: "not_emitted_yet" | "emitted_by_slowtask";
   staleEvidencePolicy: string;
@@ -333,6 +359,9 @@ export type WorkbenchTaskWire = Readonly<{
   resolved_arguments: Readonly<Record<string, unknown>>;
   missing_fields: readonly string[];
   conflicting_fields: readonly string[];
+  slot_summary?: readonly Readonly<Record<string, unknown>>[];
+  readiness?: Readonly<Record<string, unknown>>;
+  clarification?: Readonly<Record<string, unknown>> | null;
   plan_versions: readonly Readonly<Record<string, unknown>>[];
   evidence: readonly WorkbenchEvidenceWire[];
   stale_evidence: readonly WorkbenchEvidenceWire[];

@@ -35,6 +35,12 @@ export function PlanEvidencePanel({
 }: PlanEvidencePanelProps) {
   const currentEvidence = scenario.evidence.filter((item) => !item.stale);
   const evidenceByKind = groupEvidenceByKind(currentEvidence);
+  const readiness = scenario.slowTask.readiness ?? {
+    search: false,
+    plan: false,
+    commitment: false,
+  };
+  const slotSummary = scenario.slowTask.slotSummary ?? [];
 
   return (
     <section className="panel evidence-panel" aria-labelledby="evidence-heading">
@@ -98,6 +104,45 @@ export function PlanEvidencePanel({
         <strong>SlowTask processing</strong>
         <p>{scenario.slowTask.processingSummary}</p>
       </div>
+
+      <div className="readiness-strip" aria-label="SlowTask readiness">
+        <span data-ready={readiness.search}>search</span>
+        <span data-ready={readiness.plan}>plan</span>
+        <span data-ready={readiness.commitment}>commitment</span>
+      </div>
+
+      {scenario.slowTask.clarification ? (
+        <div className="policy-note">
+          <strong>Current clarification</strong>
+          <p>
+            blocked_stage={scenario.slowTask.clarification.blockedStage};
+            reason={scenario.slowTask.clarification.reason};
+            attempt={scenario.slowTask.clarification.attempt};
+            ask_fields={scenario.slowTask.clarification.askFields.join(", ")}
+          </p>
+        </div>
+      ) : null}
+
+      {slotSummary.length > 0 ? (
+        <div className="slot-ledger">
+          <h3>Slot ledger</h3>
+          <div className="slot-ledger-list">
+            {slotSummary.map((slot) => (
+              <article className="slot-ledger-item" data-state={slot.state} key={slot.name}>
+                <div>
+                  <strong>{slot.label}</strong>
+                  <span>{slot.state}</span>
+                </div>
+                <p>{slot.valuePreview || "待补充"}</p>
+                <small>
+                  source={slot.source}; asked={slot.askedCount}
+                  {slot.requiredFor.length > 0 ? `; required_for=${slot.requiredFor.join(", ")}` : ""}
+                </small>
+              </article>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div className="policy-note">
         <strong>Stale evidence policy</strong>

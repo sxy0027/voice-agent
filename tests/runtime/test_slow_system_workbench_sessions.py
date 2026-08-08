@@ -30,7 +30,7 @@ def test_python_owned_session_starts_dynamic_tool_phase_with_fake_codex() -> Non
         initial = await session.snapshot()
         assert initial["task"] is None
         result = await session.process_message(
-            "帮我规划一个明天上午两天的客户来访行程，地点尽量靠近公司。",
+            "帮我规划一个明天上午两天的客户来访行程，地点尽量靠近公司，6个人。",
             action="start",
         )
         snapshot = result["snapshot"]
@@ -65,20 +65,28 @@ def test_python_owned_session_waits_for_user_when_critical_slots_are_missing() -
         )
 
         result = await session.process_message(
-            "帮我规划一个两天的客户来访行程，地点尽量靠近公司。",
+            "帮我规划一个接待客户流程。",
             action="start",
         )
         snapshot = result["snapshot"]
 
         assert result["status"] == "waiting_for_slot"
         assert snapshot["task"]["lifecycle"] == "WAITING_FOR_SLOT"
-        assert snapshot["task"]["missing_fields"] == ["time_window"]
+        assert snapshot["task"]["missing_fields"] == ["time_window", "location_anchor", "party_size"]
         assert snapshot["task"]["in_flight_tool_calls"] == []
         assert snapshot["codex_proposals"][-1]["proposal_type"] == "clarification"
-        assert snapshot["codex_proposals"][-1]["known_fields"] == ["location_anchor"]
-        assert snapshot["codex_proposals"][-1]["missing_fields"] == ["time_window"]
+        assert snapshot["codex_proposals"][-1]["backend_selected_ask_fields"] == [
+            "time_window",
+            "location_anchor",
+            "party_size",
+        ]
+        assert snapshot["codex_proposals"][-1]["covered_fields"] == [
+            "time_window",
+            "location_anchor",
+            "party_size",
+        ]
         assert any(item.get("blocked_on_user") is True for item in snapshot["live_progress"])
-        assert "用餐日期与具体时段" in result["snapshot"]["conversation"][-1]["text"]
+        assert "接待时间" in result["snapshot"]["conversation"][-1]["text"]
 
     asyncio.run(scenario())
 
@@ -95,11 +103,11 @@ def test_workbench_remembers_user_supplied_slots_across_turns() -> None:
             action="start",
         )
         assert first["status"] == "waiting_for_slot"
-        assert first["snapshot"]["task"]["missing_fields"] == ["location_anchor"]
+        assert first["snapshot"]["task"]["missing_fields"] == ["location_anchor", "party_size"]
         assert first["snapshot"]["task"]["in_flight_tool_calls"] == []
 
         supplied = await session.process_message(
-            "公司位置在北京中关村领展附近，具体时间为 7 月 25 号中午 12 点",
+            "公司位置在北京中关村领展附近，具体时间为 7 月 25 号中午 12 点，6个人，人均200以内，没有忌口",
         )
         supplied_snapshot = supplied["snapshot"]
         assert supplied["status"] == "tool_running"
@@ -110,6 +118,7 @@ def test_workbench_remembers_user_supplied_slots_across_turns() -> None:
         assert set(supplied_snapshot["codex_proposals"][-1]["known_fields"]) >= {
             "location_anchor",
             "time_window",
+            "party_size",
         }
         assert supplied_snapshot["codex_proposals"][-1]["missing_fields"] == []
         assert supplied_snapshot["conversation"][-1]["text"] == supplied_snapshot["codex_proposals"][-1]["summary"]
@@ -121,6 +130,112 @@ def test_workbench_remembers_user_supplied_slots_across_turns() -> None:
         assert complaint_snapshot["task"]["current_plan_version"] == plan_version
         assert complaint_snapshot["task"]["missing_fields"] == []
         assert "已经记录的信息" in complaint_snapshot["conversation"][-1]["text"]
+
+    asyncio.run(scenario())
+
+
+def test_customer_reception_core_fill_keeps_plan_version_and_passes_readiness() -> None:
+    async def scenario() -> None:
+        session = WorkbenchSession(
+            session_id="test_customer_reception_core_fill",
+            config=WorkbenchRuntimeConfig(provider_mode="fake"),
+        )
+
+        initial = await session.process_message("帮我规划一个接待客户流程。", action="start")
+        assert initial["status"] == "waiting_for_slot"
+        assert initial["snapshot"]["task"]["missing_fields"] == [
+            "time_window",
+            "location_anchor",
+            "party_size",
+        ]
+        assert initial["snapshot"]["task"]["in_flight_tool_calls"] == []
+
+        supplied = await session.process_message("下周二下午，在中关村，6个人。")
+        snapshot = supplied["snapshot"]
+
+        assert supplied["status"] == "tool_running"
+        assert snapshot["task"]["current_plan_version"] == 1
+        assert snapshot["task"]["readiness"]["search"] is True
+        assert snapshot["task"]["readiness"]["plan"] is True
+        assert snapshot["task"]["missing_fields"] == []
+        slot_states = {item["name"]: item["state"] for item in snapshot["task"]["slot_summary"]}
+        assert slot_states["time_window"] == "RESOLVED"
+        assert slot_states["location_anchor"] == "RESOLVED"
+        assert slot_states["party_size"] == "RESOLVED"
+        assert not any(event["event_name"] == "PLAN_VERSION_ADVANCED" for event in snapshot["timeline"])
+
+    asyncio.run(scenario())
+
+
+def test_meal_planning_asks_budget_and_dietary_after_core_fields() -> None:
+    async def scenario() -> None:
+        session = WorkbenchSession(
+            session_id="test_meal_second_group",
+            config=WorkbenchRuntimeConfig(provider_mode="fake"),
+        )
+
+        await session.process_message("帮我规划客户接待午餐，选云南菜。", action="start")
+        result = await session.process_message("下周二下午，在中关村，6个人。")
+        snapshot = result["snapshot"]
+
+        assert result["status"] == "waiting_for_slot"
+        assert snapshot["task"]["clarification"]["blocked_stage"] == "plan"
+        assert snapshot["task"]["clarification"]["ask_fields"] == ["budget", "dietary_constraints"]
+        assert snapshot["task"]["missing_fields"] == ["budget", "dietary_constraints"]
+        assert snapshot["task"]["in_flight_tool_calls"] == []
+        assert snapshot["codex_proposals"][-1]["backend_selected_ask_fields"] == [
+            "budget",
+            "dietary_constraints",
+        ]
+
+        filled = await session.process_message("人均300以内，没有忌口。")
+        filled_snapshot = filled["snapshot"]
+        assert filled["status"] == "tool_running"
+        dietary = next(
+            item for item in filled_snapshot["task"]["slot_summary"] if item["name"] == "dietary_constraints"
+        )
+        assert dietary["state"] == "RESOLVED"
+        assert dietary["value_preview"] == "无"
+        if filled_snapshot["task"]["clarification"]:
+            assert "time_window" not in filled_snapshot["task"]["clarification"]["ask_fields"]
+
+    asyncio.run(scenario())
+
+
+def test_ambiguous_time_patch_reasks_time_without_tool_start() -> None:
+    async def scenario() -> None:
+        session = WorkbenchSession(
+            session_id="test_ambiguous_time_reask",
+            config=WorkbenchRuntimeConfig(provider_mode="fake"),
+        )
+
+        await session.process_message("帮我规划一个接待客户流程。", action="start")
+        result = await session.process_message("下周吧，在中关村，6个人。")
+        snapshot = result["snapshot"]
+
+        assert result["status"] == "waiting_for_slot"
+        assert snapshot["task"]["in_flight_tool_calls"] == []
+        assert snapshot["task"]["clarification"]["reason"] == "ambiguous"
+        assert snapshot["task"]["clarification"]["ask_fields"] == ["time_window"]
+        assert snapshot["task"]["missing_fields"] == ["time_window"]
+        assert "星期几" in snapshot["conversation"][-1]["text"]
+
+    asyncio.run(scenario())
+
+
+def test_no_silent_fixture_defaults_in_missing_or_partial_inputs() -> None:
+    async def scenario() -> None:
+        session = WorkbenchSession(
+            session_id="test_no_silent_fixture_defaults",
+            config=WorkbenchRuntimeConfig(provider_mode="fake"),
+        )
+
+        result = await session.process_message("帮我规划一个接待客户流程。", action="start")
+        payload = json.dumps(result["snapshot"], ensure_ascii=False)
+
+        assert "Synthetic Central Office" not in payload
+        assert "flexible" not in payload
+        assert "2 days" not in payload
 
     asyncio.run(scenario())
 
@@ -468,7 +583,35 @@ def test_codex_proposal_projection_keeps_model_gap_analysis_separate_from_state_
 
     assert proposal["known_fields"] == ["location_anchor"]
     assert proposal["missing_fields"] == ["party_size"]
+    assert proposal["status"] == "degraded"
+    assert proposal["backend_selected_ask_fields"] == ["time_window"]
+    assert proposal["covered_fields"] == ["time_window"]
     assert any("后端当前状态" in note for note in proposal["risk_notes"])
+
+
+def test_codex_clarification_contract_rejects_extra_ask_fields() -> None:
+    proposal = _proposal_from_structured_output(
+        {
+            "task_binding": {"adapter_request_id": "request_extra_field"},
+            "task_analysis": {
+                "summary": "我还想问地点和预算。",
+                "intent": "clarify_extra_field",
+            },
+            "tool_proposal": {"tool_name": "demo.itinerary.search"},
+            "confirmation_risk_hints": [],
+            "known_fields": [],
+            "missing_fields": ["location_anchor", "budget"],
+        },
+        source_evidence_refs=("evidence://synthetic/user/request",),
+        provider_mode="codex_cli_local",
+        output_mode="real",
+        state_missing_fields=("location_anchor",),
+    )
+
+    assert proposal["status"] == "degraded"
+    assert proposal["backend_selected_ask_fields"] == ["location_anchor"]
+    assert proposal["covered_fields"] == ["location_anchor"]
+    assert proposal["diagnostic_model_missing_fields"] == ["location_anchor", "budget"]
 
 
 def test_material_patch_advances_plan_and_late_tool_result_is_stale() -> None:
@@ -477,9 +620,9 @@ def test_material_patch_advances_plan_and_late_tool_result_is_stale() -> None:
             session_id="test_dynamic_patch",
             config=WorkbenchRuntimeConfig(provider_mode="fake"),
         )
-        await session.process_message("明天上午在公司附近规划两天客户行程", action="start")
+        await session.process_message("明天上午在公司附近规划两天客户行程，6个人", action="start")
         result = await session.process_message(
-            "改成明天上午，预算不超过 500 元。",
+            "改成明天下午，预算不超过 500 元。",
             action="material_patch",
         )
         snapshot = result["snapshot"]
@@ -525,7 +668,7 @@ def test_final_plan_request_does_not_become_a_material_patch() -> None:
         assert len(
             [event for event in snapshot["timeline"] if event["event_name"] == "PLAN_VERSION_ADVANCED"]
         ) == 1
-        assert "尚未取得可验证的地点检索结果" in snapshot["conversation"][-1]["text"]
+        assert "系统没有执行订位、支付或任何外部写操作" in snapshot["conversation"][-1]["text"]
 
     asyncio.run(scenario())
 
@@ -599,7 +742,7 @@ def test_completed_plan_recap_is_safe_and_does_not_become_active_task_patch() ->
 
         session._place_search_adapter = StubPlaceSearch()
         first = await session.process_message(
-            "请规划 8 人客户晚餐，选云南菜；地点在北京市海淀区中关村附近，晚上 18 点半，人均 200 元以内。",
+            "请规划 8 人客户晚餐，选云南菜；地点在北京市海淀区中关村附近，晚上 18 点半，人均 200 元以内，没有忌口。",
             action="start",
         )
         assert first["snapshot"]["task"]["lifecycle"] == "PLANNING"
@@ -643,7 +786,7 @@ def test_revision_after_auto_published_plan_advances_same_task_version() -> None
 
         session._place_search_adapter = StubPlaceSearch()
         original = await session.process_message(
-            "请规划 8 人客户午餐，选云南菜；地点在北京市海淀区中关村附近，12 点半，人均 200 元以内。",
+            "请规划 8 人客户午餐，选云南菜；地点在北京市海淀区中关村附近，12 点半，人均 200 元以内，没有忌口。",
             action="start",
         )
         original_task_id = original["snapshot"]["task"]["task_id"]
@@ -676,8 +819,9 @@ def test_missing_slot_reply_names_each_required_user_input() -> None:
         # The Workbench displays the validated Codex realization candidate;
         # SlowTask owns the missing_fields state, not the wording itself.
         assert reply == proposal_summary
-        assert "用餐日期与具体时段" in reply
-        assert "明确的位置锚点" in reply
+        assert "接待时间" in reply
+        assert "位置锚点" in reply
+        assert "大概人数" in reply
         assert "explicit_user_confirmation" not in reply
 
     asyncio.run(scenario())
@@ -706,10 +850,10 @@ def test_workbench_displays_validated_codex_realization_for_clarification_and_pr
         missing = await session.process_message("请帮忙规划一个接待午饭，选云南菜。", action="start")
         assert missing["status"] == "waiting_for_slot"
         assert missing["snapshot"]["conversation"][-1]["text"] == (
-            "我已理解你要安排云南菜接待。为了继续，请告诉我用餐时间和可定位的地点范围。"
+            "继续前还需要确认：明确的位置锚点、用餐人数。"
         )
 
-        ready = await session.process_message("地点在北京中关村附近，明天中午 12 点。")
+        ready = await session.process_message("地点在北京中关村附近，明天中午 12 点，6人，人均200以内，没有忌口。")
         assert ready["status"] == "tool_running"
         assert ready["snapshot"]["conversation"][-1]["text"] == (
             "地点和时间已收到；我正在根据当前约束准备只读候选查询。"
@@ -745,7 +889,7 @@ def test_cancel_requires_current_confirmation_then_clears_focus() -> None:
             session_id="test_dynamic_cancel",
             config=WorkbenchRuntimeConfig(provider_mode="fake"),
         )
-        await session.process_message("明天上午在公司附近规划两天客户行程", action="start")
+        await session.process_message("明天上午在公司附近规划两天客户行程，6个人", action="start")
         candidate = await session.process_message("取消这个任务", action="cancel_candidate")
         pending = candidate["snapshot"]["task"]["pending_confirmation"]
 

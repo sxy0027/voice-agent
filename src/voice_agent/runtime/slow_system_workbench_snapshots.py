@@ -192,6 +192,7 @@ def project_workbench_snapshot(
         slowtask_state,
         tool_execution_state=tool_execution_state,
         evidence_catalog=evidence_catalog,
+        context_pack=context_pack,
         task_created_event_id=task_created_event_id,
     )
     router = _public_router(events, task_focus_state=task_focus_state)
@@ -261,6 +262,7 @@ def _public_task(
     *,
     tool_execution_state: ToolExecutionState,
     evidence_catalog: Mapping[str, Mapping[str, Any]],
+    context_pack: TaskContextPack,
     task_created_event_id: str | None = None,
 ) -> dict[str, Any] | None:
     task = _active_or_last_task(state)
@@ -303,6 +305,9 @@ def _public_task(
         },
         "missing_fields": current_missing_fields,
         "conflicting_fields": _task_fields(task, {"AMBIGUITY_DETECTED"}),
+        "slot_summary": deepcopy(list(context_pack.slot_summary)),
+        "readiness": deepcopy(dict(context_pack.readiness)),
+        "clarification": deepcopy(dict(context_pack.clarification)) if context_pack.clarification is not None else None,
         "plan_versions": plan_versions,
         "evidence": current_evidence,
         "stale_evidence": stale_evidence,
@@ -616,16 +621,16 @@ def _timing_summary(
 
 
 def _task_fields(task: SlowTaskRecord, names: set[str]) -> list[str]:
-    values: list[str] = []
-    for event in (*task.evidence_events, *task.progress_events):
+    for event in reversed((*task.evidence_events, *task.progress_events)):
         if event.event_name not in names:
             continue
+        values: list[str] = []
         for ref in event.refs:
-            if not _field_like(ref):
-                continue
-            if ref not in values:
+            if _field_like(ref) and ref not in values:
                 values.append(ref)
-    return values[:24]
+        if values:
+            return values[:24]
+    return []
 
 
 def _field_like(value: str) -> bool:

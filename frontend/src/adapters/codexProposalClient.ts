@@ -11,8 +11,11 @@ import type {
   SlowSystemScenario,
   SlowTaskLifecycleState,
   SlowTaskTimelineEvent,
-  WorkbenchSnapshotWire,
   WorkbenchEvidenceWire,
+  WorkbenchSnapshotWire,
+  WorkbenchTaskWire,
+  SlotSummaryItem,
+  ClarificationSummary,
 } from "../slowSystem";
 
 export type CodexProviderMode = "fake" | "codex_cli_local" | "codex_cli_unavailable";
@@ -416,6 +419,9 @@ export function workbenchSnapshotToScenario(
       planVersions: planVersions.length > 0 ? planVersions : baseScenario.slowTask.planVersions,
       missingFields: task?.missing_fields ?? baseScenario.slowTask.missingFields,
       conflictingFields: task?.conflicting_fields ?? baseScenario.slowTask.conflictingFields,
+      slotSummary: toSlotSummary(task?.slot_summary),
+      readiness: toReadiness(task?.readiness),
+      clarification: toClarification(task?.clarification),
       pendingConfirmation,
       semanticCommitmentStatus,
       staleEvidencePolicy: task?.stale_evidence_policy ?? baseScenario.slowTask.staleEvidencePolicy,
@@ -430,6 +436,55 @@ export function workbenchSnapshotToScenario(
     proposalType: proposal.proposalType,
     answer: proposal.summary,
   };
+}
+
+function toSlotSummary(value: WorkbenchTaskWire["slot_summary"] | undefined): SlotSummaryItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => ({
+    name: String(item.name ?? ""),
+    label: String(item.label ?? item.name ?? ""),
+    state: asSlotState(item.state),
+    valuePreview: String(item.value_preview ?? ""),
+    source: String(item.source ?? "unknown"),
+    requiredFor: Array.isArray(item.required_for) ? item.required_for.map(String) : [],
+    askedCount: typeof item.asked_count === "number" ? item.asked_count : 0,
+  }));
+}
+
+function toReadiness(value: WorkbenchTaskWire["readiness"] | undefined) {
+  return {
+    search: Boolean(value?.search),
+    plan: Boolean(value?.plan),
+    commitment: Boolean(value?.commitment),
+  };
+}
+
+function toClarification(value: WorkbenchTaskWire["clarification"] | undefined | null): ClarificationSummary | undefined {
+  if (!value) {
+    return undefined;
+  }
+  return {
+    blockedStage: asBlockedStage(value.blocked_stage),
+    askFields: Array.isArray(value.ask_fields) ? value.ask_fields.map(String) : [],
+    reason: asClarificationReason(value.reason),
+    attempt: typeof value.attempt === "number" ? value.attempt : 1,
+  };
+}
+
+function asSlotState(value: unknown): SlotSummaryItem["state"] {
+  return value === "UNKNOWN" || value === "CANDIDATE" || value === "RESOLVED" || value === "AMBIGUOUS" || value === "CONFLICTING" || value === "DEFAULTED"
+    ? value
+    : "UNKNOWN";
+}
+
+function asBlockedStage(value: unknown): ClarificationSummary["blockedStage"] {
+  return value === "plan" || value === "commitment" ? value : "search";
+}
+
+function asClarificationReason(value: unknown): ClarificationSummary["reason"] {
+  return value === "ambiguous" || value === "conflicting" ? value : "missing";
 }
 
 function hasActiveTask(snapshot: WorkbenchSnapshotWire): boolean {

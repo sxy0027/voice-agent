@@ -45,7 +45,26 @@ from voice_agent.runtime.slow_system_workbench_snapshots import (
     WorkbenchSnapshot,
     project_workbench_snapshot,
 )
+from voice_agent.slowtask.clarification_policy import (
+    ClarificationPlan,
+    asked_count_map_from_events,
+    plan_clarification,
+)
 from voice_agent.slowtask.mock_runtime import MockSlowTaskRuntime
+from voice_agent.slowtask.slot_ledger import (
+    SlotLedger,
+    SlotState,
+    SlotUpdate,
+    build_slot_ledger,
+    updates_from_evidence_catalog,
+)
+from voice_agent.slowtask.task_schema import (
+    RequirementAssessment,
+    RequirementStage,
+    TaskSchema,
+    customer_reception_schema,
+    evaluate_requirements,
+)
 from voice_agent.state.slowtask_state import SlowTaskRecord, SlowTaskState
 from voice_agent.state.task_focus_state import TaskFocusState
 from voice_agent.state.tool_execution_state import ToolExecutionState
@@ -390,7 +409,9 @@ class WorkbenchSession:
         self._current_plan_tool_payloads: dict[tuple[str, int], Mapping[str, Any]] = {}
         self._last_user_input: str | None = None
         self._resolved_argument_values: dict[str, Any] = {}
-        self._slot_values: dict[str, str] = {}
+        self._slot_values: dict[str, Any] = {}
+        self._task_features: dict[str, Any] = {}
+        self._task_schema = self._customer_reception_schema()
         # This is a presentation cache of a SemanticCommitment-backed answer.
         # It never advances a plan or replaces the event-journal projection.
         self._last_completed_plan_summary: str | None = None
@@ -545,6 +566,12 @@ class WorkbenchSession:
     ) -> dict[str, str]:
         task_id = self._next_id("task")
         evidence_ref = self._next_ref("evidence", "user")
+        initial_slot_updates = _extract_workbench_slot_updates(
+            text,
+            evidence_ref=evidence_ref,
+            plan_version=1,
+            source="user_text",
+        )
         self._record_evidence(
             evidence_ref,
             task_id=task_id,
@@ -553,7 +580,9 @@ class WorkbenchSession:
             summary=text,
             source="user_text",
             trust_level="authoritative_user_evidence",
+            slot_updates=initial_slot_updates,
         )
+        self._task_features.update(_extract_workbench_task_features(text))
         prefix = self._next_id("spawn")
         created = self._slowtask_runtime.create_from_router_spawn(
             router_decision_event=router_event,
@@ -585,8 +614,13 @@ class WorkbenchSession:
         )
         planning_event = planning.produced_events[0]
         self._merge_slot_values(text)
-        missing_slots = _missing_critical_slots(self._slot_values)
-        if missing_slots:
+        assessment = self._requirement_assessment(task_id)
+        clarification = self._clarification_plan(
+            task_id=task_id,
+            clarification_id=self._next_id("clarification"),
+        )
+        blocking_fields = clarification.ask_fields if clarification is not None else ()
+        if clarification is not None:
             review = self._slowtask_runtime.review_evidence(
                 task_id=task_id,
                 plan_version=1,
@@ -596,11 +630,12 @@ class WorkbenchSession:
                 created_wall_clock_ms=self._clock.wall_clock_ms,
                 start_task_event_seq=5,
                 evidence_refs=(evidence_ref,),
-                required_fields=("location_anchor", "time_window"),
-                resolved_fields=tuple(_resolved_critical_slots(self._slot_values)),
-                missing_fields=missing_slots,
+                required_fields=tuple(self._task_schema.slots_by_name),
+                resolved_fields=self._slot_ledger_for_task(task_id).resolved_fields(),
+                ambiguous_fields=tuple((*assessment.ambiguous_fields, *assessment.conflicting_fields)),
+                missing_fields=blocking_fields if clarification.reason == "missing" else (),
                 clarification_prompt_ref=self._next_ref("prompt", "missing_slots"),
-                resolution_reason="workbench_critical_slot_check",
+                resolution_reason=f"schema_requirement_{clarification.reason}",
             )
             evidence_reviewed_event = next(
                 event for event in review.produced_events if event["event_name"] == "EVIDENCE_REVIEWED"
@@ -609,7 +644,7 @@ class WorkbenchSession:
                 intent=text,
                 slowtask_event=evidence_reviewed_event,
                 source_evidence_refs=(evidence_ref,),
-                state_missing_fields_hint=missing_slots,
+                state_missing_fields_hint=blocking_fields,
             )
             self._codex_proposals.append(provider_result.proposal)
             codex_ref = self._next_ref("evidence", "codex")
@@ -672,10 +707,20 @@ class WorkbenchSession:
         # Keep the pre-patch slots separate from the incoming values.  The
         # SlowTask runtime, not Router, uses this diff to distinguish filling
         # v1's missing fields from replacing a value that v1 already owns.
-        pre_patch_slots = dict(self._slot_values)
-        incoming_slot_values = _extract_workbench_slots(text) if patch_kind == "material" else {}
         patch_id = self._next_id("patch")
         evidence_ref = self._next_ref("evidence", "patch")
+        pre_patch_slots = dict(self._slot_values)
+        incoming_slot_updates = (
+            _extract_workbench_slot_updates(
+                text,
+                evidence_ref=evidence_ref,
+                plan_version=task.current_plan_version,
+                source="user_patch",
+            )
+            if patch_kind == "material"
+            else ()
+        )
+        incoming_slot_values = _slot_value_map(incoming_slot_updates)
         patch_result = self._user_patch_runtime.receive_patch_from_router_decision(
             router_decision_event=router_event,
             turn_committed_event=turn,
@@ -702,9 +747,11 @@ class WorkbenchSession:
             summary=text,
             source="user_patch",
             trust_level="authoritative_user_evidence",
+            slot_updates=incoming_slot_updates,
         )
         if patch_kind == "material":
             self._slot_values.update(incoming_slot_values)
+            self._task_features.update(_extract_workbench_task_features(text))
         handle = self._handle_for_task(task.task_id)
         if handle is not None:
             handle.record_task_event(patch_result.user_patch_event)
@@ -747,8 +794,8 @@ class WorkbenchSession:
             # planning and start its first current-plan lookup.
             task_state, _, _ = self._projections()
             current_task = task_state.tasks[task.task_id]
-            missing_slots = _missing_critical_slots(self._slot_values)
-            if current_task.lifecycle_state == "WAITING_FOR_SLOT" and not missing_slots:
+            clarification = self._clarification_plan(task_id=current_task.task_id)
+            if current_task.lifecycle_state == "WAITING_FOR_SLOT" and clarification is None:
                 resumed = self._slowtask_runtime.run_planning_started(
                     task_id=current_task.task_id,
                     plan_version=current_task.current_plan_version,
@@ -787,16 +834,25 @@ class WorkbenchSession:
                     started=started,
                     router_event=router_event,
                 )
+            if current_task.lifecycle_state == "WAITING_FOR_SLOT" and clarification is not None:
+                return await self._request_schema_clarification(
+                    task=current_task,
+                    caused_by_event_id=str(current_task.last_slowtask_event_id),
+                    evidence_refs=(evidence_ref,),
+                    clarification=clarification,
+                    intent=text,
+                )
             return {
                 "status": "patch_recorded",
                 "assistant_summary": "用户补充已记录到当前计划；它没有替换既有约束，因此未改变 plan_version。",
             }
-        missing_slots = _missing_critical_slots(self._slot_values)
+        clarification = self._clarification_plan(task_id=task.task_id)
+        selected_ask_fields = clarification.ask_fields if clarification is not None else ()
         provider_result = await self._call_codex(
             intent=text,
             slowtask_event=restarted,
             source_evidence_refs=(evidence_ref,),
-            state_missing_fields_hint=missing_slots,
+            state_missing_fields_hint=selected_ask_fields,
         )
         self._codex_proposals.append(provider_result.proposal)
         codex_ref = self._next_ref("evidence", "codex")
@@ -813,26 +869,15 @@ class WorkbenchSession:
         if handle is None:
             task_state, _, _ = self._projections()
             current_task = task_state.tasks[task.task_id]
-            if missing_slots:
-                self._slowtask_runtime.review_evidence(
-                    task_id=current_task.task_id,
-                    plan_version=current_task.current_plan_version,
+            if clarification is not None:
+                return await self._request_schema_clarification(
+                    task=current_task,
                     caused_by_event_id=str(provider_result.structured_output_event["event_id"]),
-                    event_id_prefix=self._next_id("missing_slot_review"),
-                    created_monotonic_ms=self._clock.monotonic_ms,
-                    created_wall_clock_ms=self._clock.wall_clock_ms,
-                    start_task_event_seq=current_task.current_task_event_seq + 1,
                     evidence_refs=(evidence_ref, codex_ref),
-                    required_fields=("location_anchor", "time_window"),
-                    resolved_fields=tuple(_resolved_critical_slots(self._slot_values)),
-                    missing_fields=missing_slots,
-                    clarification_prompt_ref=self._next_ref("prompt", "missing_slots"),
-                    resolution_reason="workbench_user_patch_slot_check",
+                    clarification=clarification,
+                    intent=text,
+                    provider_result=provider_result,
                 )
-                return {
-                    "status": "waiting_for_slot",
-                    "assistant_summary": _codex_user_visible_reply(provider_result),
-                }
             started = self._review_and_start_itinerary_tool(
                 task_id=current_task.task_id,
                 caused_by_event_id=str(provider_result.structured_output_event["event_id"]),
@@ -1070,6 +1115,15 @@ class WorkbenchSession:
         task = self._task_for_focus(task_state, focus_state)
         if task is None:
             return {"status": "no_active_task", "assistant_summary": "当前没有可完成的 SlowTask。"}
+        clarification = self._clarification_plan(task_id=task.task_id)
+        if clarification is not None:
+            return await self._request_schema_clarification(
+                task=task,
+                caused_by_event_id=str(task.last_slowtask_event_id),
+                evidence_refs=tuple(task.source_evidence_refs[-4:]),
+                clarification=clarification,
+                intent=text,
+            )
         completed_payload: Mapping[str, Any] | None = self._current_plan_tool_payloads.get(
             (task.task_id, task.current_plan_version)
         )
@@ -1246,7 +1300,7 @@ class WorkbenchSession:
         created_monotonic_ms: int,
         created_wall_clock_ms: int,
     ) -> Any:
-        if handle.request.tool_name != "webSearch":
+        if handle.request.tool_name != "webSearch" or self._config.provider_mode == "fake":
             return self._tool_executor.complete(
                 handle,
                 created_monotonic_ms=created_monotonic_ms,
@@ -1661,8 +1715,126 @@ class WorkbenchSession:
                 return handle
         return None
 
+    def _customer_reception_schema(self) -> TaskSchema:
+        manifests = {manifest.tool_name: manifest.required_arguments for manifest in mvp2_demo_tool_manifests()}
+        return customer_reception_schema(tool_required_arguments=manifests)
+
+    def _slot_ledger_for_task(self, task_id: str | None = None) -> SlotLedger:
+        updates = updates_from_evidence_catalog(self._evidence_catalog, task_id=task_id)
+        return build_slot_ledger(
+            updates,
+            asked_counts=asked_count_map_from_events(self._journal.events()),
+        )
+
+    def _requirement_assessment(self, task_id: str | None = None) -> RequirementAssessment:
+        return evaluate_requirements(
+            schema=self._task_schema,
+            ledger=self._slot_ledger_for_task(task_id),
+            task_features=self._task_features,
+        )
+
+    def _clarification_plan(
+        self,
+        *,
+        task_id: str | None = None,
+        clarification_id: str | None = None,
+    ) -> ClarificationPlan | None:
+        ledger = self._slot_ledger_for_task(task_id)
+        assessment = evaluate_requirements(
+            schema=self._task_schema,
+            ledger=ledger,
+            task_features=self._task_features,
+        )
+        return plan_clarification(
+            schema=self._task_schema,
+            ledger=ledger,
+            assessment=assessment,
+            clarification_id=clarification_id or self._next_id("clarification"),
+        )
+
     def _merge_slot_values(self, text: str) -> None:
-        self._slot_values.update(_extract_workbench_slots(text))
+        self._slot_values.update(_slot_value_map(_extract_workbench_slot_updates(text)))
+        self._task_features.update(_extract_workbench_task_features(text))
+
+    async def _request_schema_clarification(
+        self,
+        *,
+        task: SlowTaskRecord,
+        caused_by_event_id: str,
+        evidence_refs: Sequence[str],
+        clarification: ClarificationPlan,
+        intent: str,
+        provider_result: Any | None = None,
+    ) -> dict[str, str]:
+        review_cause = caused_by_event_id
+        task_state, _, _ = self._projections()
+        current_task = task_state.tasks[task.task_id]
+        if current_task.lifecycle_state == "WAITING_FOR_SLOT":
+            recheck = self._slowtask_runtime.run_planning_started(
+                task_id=current_task.task_id,
+                plan_version=current_task.current_plan_version,
+                caused_by_event_id=str(current_task.last_slowtask_event_id),
+                event_id_prefix=self._next_id("slot_clarification_recheck"),
+                created_monotonic_ms=self._clock.monotonic_ms,
+                created_wall_clock_ms=self._clock.wall_clock_ms,
+                start_task_event_seq=current_task.current_task_event_seq + 1,
+                from_state="WAITING_FOR_SLOT",
+                planning_reason="schema_clarification_recheck_same_plan_version",
+            )
+            review_cause = str(recheck.produced_events[0]["event_id"])
+            task_state, _, _ = self._projections()
+            current_task = task_state.tasks[task.task_id]
+
+        assessment = self._requirement_assessment(task.task_id)
+        selected_fields = clarification.ask_fields
+        ambiguous_or_conflicting = (
+            selected_fields
+            if clarification.reason in {"ambiguous", "conflicting"}
+            else tuple((*assessment.ambiguous_fields, *assessment.conflicting_fields))
+        )
+        review = self._slowtask_runtime.review_evidence(
+            task_id=current_task.task_id,
+            plan_version=current_task.current_plan_version,
+            caused_by_event_id=review_cause,
+            event_id_prefix=self._next_id("schema_clarification_review"),
+            created_monotonic_ms=self._clock.monotonic_ms,
+            created_wall_clock_ms=self._clock.wall_clock_ms,
+            start_task_event_seq=current_task.current_task_event_seq + 1,
+            evidence_refs=evidence_refs,
+            required_fields=tuple(self._task_schema.slots_by_name),
+            resolved_fields=self._slot_ledger_for_task(current_task.task_id).resolved_fields(),
+            ambiguous_fields=ambiguous_or_conflicting,
+            missing_fields=selected_fields if clarification.reason == "missing" else (),
+            clarification_prompt_ref=self._next_ref("prompt", "missing_slots"),
+            resolution_reason=f"schema_requirement_{clarification.reason}",
+        )
+        if provider_result is None:
+            evidence_reviewed_event = next(
+                event for event in review.produced_events if event["event_name"] == "EVIDENCE_REVIEWED"
+            )
+            provider_result = await self._call_codex(
+                intent=intent,
+                slowtask_event=evidence_reviewed_event,
+                source_evidence_refs=evidence_refs,
+                state_missing_fields_hint=selected_fields,
+            )
+            self._codex_proposals.append(provider_result.proposal)
+            task_state, _, _ = self._projections()
+            current_task = task_state.tasks[task.task_id]
+            codex_ref = self._next_ref("evidence", "codex")
+            self._record_evidence(
+                codex_ref,
+                task_id=current_task.task_id,
+                plan_version=current_task.current_plan_version,
+                label="Codex clarification proposal",
+                summary="Codex 只生成了追问建议；SlowTask 保持 WAITING_FOR_SLOT，不启动工具。",
+                source="codex_adapter",
+                trust_level="evidence_candidate_only",
+            )
+        return {
+            "status": "waiting_for_slot",
+            "assistant_summary": _codex_user_visible_reply(provider_result),
+        }
 
     def _review_and_start_itinerary_tool(
         self,
@@ -1673,6 +1845,35 @@ class WorkbenchSession:
     ) -> dict[str, str]:
         task_state, _, _ = self._projections()
         task = task_state.tasks[task_id]
+        clarification = self._clarification_plan(task_id=task_id)
+        if clarification is not None:
+            assessment = self._requirement_assessment(task_id)
+            self._slowtask_runtime.review_evidence(
+                task_id=task_id,
+                plan_version=task.current_plan_version,
+                caused_by_event_id=caused_by_event_id,
+                event_id_prefix=self._next_id("pre_tool_schema_block"),
+                created_monotonic_ms=self._clock.monotonic_ms,
+                created_wall_clock_ms=self._clock.wall_clock_ms,
+                start_task_event_seq=task.current_task_event_seq + 1,
+                evidence_refs=evidence_refs,
+                required_fields=tuple(self._task_schema.slots_by_name),
+                resolved_fields=self._slot_ledger_for_task(task_id).resolved_fields(),
+                ambiguous_fields=tuple((*assessment.ambiguous_fields, *assessment.conflicting_fields)),
+                missing_fields=clarification.ask_fields if clarification.reason == "missing" else (),
+                clarification_prompt_ref=self._next_ref("prompt", "missing_slots"),
+                resolution_reason=f"pre_tool_schema_requirement_{clarification.reason}",
+            )
+            return {
+                "status": "waiting_for_slot",
+                "assistant_summary": "我还不能开始查询，因为当前接待规划仍缺少或含糊的信息；请先补充追问中的字段。",
+            }
+
+        required_fields = tuple(
+            field
+            for field in ("time_window", "location_anchor", "party_size")
+            if field in self._task_schema.slots_by_name
+        )
         review = self._slowtask_runtime.review_evidence(
             task_id=task_id,
             plan_version=task.current_plan_version,
@@ -1682,8 +1883,8 @@ class WorkbenchSession:
             created_wall_clock_ms=self._clock.wall_clock_ms,
             start_task_event_seq=task.current_task_event_seq + 1,
             evidence_refs=evidence_refs,
-            required_fields=("location_anchor", "time_window", "days"),
-            resolved_fields=("location_anchor", "time_window", "days"),
+            required_fields=required_fields,
+            resolved_fields=required_fields,
             resolved_arguments_ref=self._next_ref("args", "resolved"),
             provenance_ref=self._next_ref("provenance", "arguments"),
             field_provenance_refs=evidence_refs,
@@ -1697,7 +1898,11 @@ class WorkbenchSession:
         provenance_event = next(
             event for event in review.produced_events if event["event_name"] == "ARGUMENT_RESOLUTION_PROVENANCE"
         )
-        use_external_place_search = self._config.provider_mode == "codex_cli_local"
+        use_external_place_search = (
+            self._config.provider_mode == "codex_cli_local"
+            or bool(self._task_features.get("meal_planning"))
+            or "agenda_duration" not in self._slot_values
+        )
         tool_name = "webSearch" if use_external_place_search else "demo.itinerary.search"
         arguments = (
             {"query": _place_search_query(self._slot_values)}
@@ -1794,6 +1999,7 @@ class WorkbenchSession:
         source: str,
         trust_level: str,
         stale: bool = False,
+        slot_updates: Sequence[SlotUpdate] = (),
     ) -> None:
         self._evidence_catalog[evidence_ref] = {
             "evidence_id": evidence_ref,
@@ -1806,6 +2012,7 @@ class WorkbenchSession:
             "trust_level": trust_level,
             "provenance": "event_journal_projection",
             "stale": stale,
+            "slot_updates": [update.to_metadata() for update in slot_updates],
         }
 
     def _label_user_patch_evidence(
@@ -1977,86 +2184,144 @@ def _frame_hints(action: str) -> tuple[str, bool, str]:
     return "FOREGROUND_CHAT", False, "simple"
 
 
-def _extract_workbench_slots(text: str) -> dict[str, str]:
+def _extract_workbench_slot_updates(
+    text: str,
+    *,
+    evidence_ref: str = "",
+    plan_version: int = 1,
+    source: str = "user_text",
+) -> tuple[SlotUpdate, ...]:
     lowered = text.lower()
-    slots: dict[str, str] = {}
+    updates: list[SlotUpdate] = []
     compact = re.sub(r"\s+", "", text)
+
+    def add(
+        name: str,
+        value: Any,
+        *,
+        state: SlotState = SlotState.RESOLVED,
+        explicit_or_inferred: str = "explicit",
+    ) -> None:
+        updates.append(
+            SlotUpdate(
+                name=name,
+                normalized_value=value,
+                raw_evidence=_safe_summary(text),
+                state=state,
+                evidence_ref=evidence_ref,
+                source=source,
+                plan_version=plan_version,
+                explicit_or_inferred=explicit_or_inferred,
+            )
+        )
+
     location_match = re.search(
         r"((?:北京市)?(?:海淀区)?[^，。；;]{0,32}(?:中关村|领展|欧美汇|丹棱街)[^，。；;]{0,32}(?:附近|广场|购物中心|购物广场)?)",
         text,
     )
     if location_match:
-        slots["location_anchor"] = _safe_summary(location_match.group(1))
+        add("location_anchor", _safe_summary(location_match.group(1)))
     elif any(marker in text for marker in ("公司", "办公室", "园区", "酒店", "机场", "车站", "餐厅", "会议室", "地点", "附近", "位置", "中关村", "领展", "北京")) or any(
         marker in lowered for marker in ("office", "hotel", "airport", "station", "near")
     ):
-        slots["location_anchor"] = _safe_summary(text)
+        add("location_anchor", _safe_summary(text))
     explicit_time = re.search(r"(\d{1,2})\s*[点:：]\s*(半|\d{1,2})?", compact)
     if explicit_time:
         hour = int(explicit_time.group(1))
         minute = "30" if explicit_time.group(2) == "半" else (explicit_time.group(2) or "00")
-        slots["time_window"] = f"{hour:02d}:{minute}"
+        add("time_window", f"{hour:02d}:{minute}")
+    elif any(marker in text for marker in ("下周吧", "下周左右", "下周都行")):
+        add("time_window", "下周（缺少具体日期和时段）", state=SlotState.AMBIGUOUS)
     elif any(marker in text for marker in ("今天", "明天", "后天", "上午", "下午", "晚上", "中午", "午饭", "午餐", "晚饭", "晚餐", "周一", "周二", "周三", "周四", "周五", "周六", "周日")) or any(
         marker in lowered for marker in ("today", "tomorrow", "morning", "afternoon", "evening", "lunch", "dinner")
     ) or re.search(r"\d{1,2}月\d{1,2}[号日]?", compact):
-        slots["time_window"] = "晚餐时段（建议 18:30）" if any(marker in text for marker in ("晚上", "晚饭", "晚餐")) else _safe_summary(text)
+        add("time_window", "晚餐时段（建议 18:30）" if any(marker in text for marker in ("晚上", "晚饭", "晚餐")) else _safe_summary(text))
     if any(marker in text for marker in ("两天", "2天", "二天", "两日", "2日")) or any(marker in lowered for marker in ("two days", "2 days")):
-        slots["days"] = "2"
+        add("agenda_duration", "2")
     party_match = re.search(r"(\d+|[一二三四五六七八九十两]+)\s*个?人", text)
     if party_match:
-        slots["party_size"] = f"{party_match.group(1)} 人"
+        add("party_size", f"{party_match.group(1)} 人")
     budget_match = re.search(r"(人均\s*)?\d+\s*(元|块|以内|以下)", text)
     if budget_match:
         budget_digits = re.search(r"\d+", budget_match.group(0))
-        slots["budget"] = f"人均 {budget_digits.group(0)} 元以内" if budget_digits else budget_match.group(0)
-    if any(marker in text for marker in ("不吃辣", "忌口", "过敏", "清淡", "素食", "没有其他忌口")):
+        add("budget", f"人均 {budget_digits.group(0)} 元以内" if budget_digits else budget_match.group(0))
+    if any(marker in text for marker in ("无忌口", "没有忌口", "没忌口", "没有饮食限制")):
+        add("dietary_constraints", [])
+    elif any(marker in text for marker in ("不吃辣", "忌口", "过敏", "清淡", "素食", "没有其他忌口")):
         non_spicy_count = re.search(r"(\d+|[一二三四五六七八九十两]+)\s*(?:位|个)?[^，。；;]{0,8}不吃辣", text)
-        slots["dietary_constraints"] = (
+        add(
+            "dietary_constraints",
             f"{non_spicy_count.group(1)}位客人不吃辣"
             if non_spicy_count
-            else "有客人不吃辣，菜品需可分开调味"
+            else "有客人不吃辣，菜品需可分开调味",
         )
     if "云南菜" in text or "滇菜" in text:
-        slots["cuisine_preference"] = "云南菜"
+        add("cuisine_preference", "云南菜")
+    elif any(marker in text for marker in ("随便", "都可以", "都行")):
+        add("cuisine_preference", "都可以")
     if any(marker in text for marker in ("晚上", "晚饭", "晚餐")):
-        slots["meal_type"] = "晚餐"
+        add("meal_type", "晚餐")
     elif any(marker in text for marker in ("中午", "午饭", "午餐")):
-        slots["meal_type"] = "午餐"
+        add("meal_type", "午餐")
     if any(marker in text for marker in ("包间", "安静", "商务环境")):
-        slots["private_room_or_quiet_space"] = _safe_summary(text)
-    if any(marker in text for marker in ("发票", "停车", "报销")):
-        slots["admin_needs"] = _safe_summary(text)
-    return slots
+        add("private_room", _safe_summary(text))
+    if any(marker in text for marker in ("发票", "报销")):
+        add("invoice_needed", True)
+    if "停车" in text:
+        add("parking_needed", True)
+    if any(marker in text for marker in ("接送", "用车", "打车", "交通")):
+        add("transport_needed", True)
+    if any(marker in text for marker in ("重要客户", "外地客户", "海外客户", "领导", "高管")):
+        add("guest_profile", _safe_summary(text))
+    return tuple(updates)
 
 
-def _missing_critical_slots(slots: Mapping[str, str]) -> tuple[str, ...]:
-    missing: list[str] = []
-    if not slots.get("time_window"):
-        missing.append("time_window")
-    if not slots.get("location_anchor"):
-        missing.append("location_anchor")
-    return tuple(missing)
+def _slot_value_map(updates: Sequence[SlotUpdate]) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for update in updates:
+        if update.state == SlotState.RESOLVED:
+            values[update.name] = update.normalized_value
+        elif update.state in {SlotState.AMBIGUOUS, SlotState.CONFLICTING}:
+            values[update.name] = update.normalized_value
+    return values
 
 
-def _resolved_critical_slots(slots: Mapping[str, str]) -> tuple[str, ...]:
-    return tuple(field for field in ("location_anchor", "time_window") if slots.get(field))
+def _extract_workbench_task_features(text: str) -> dict[str, Any]:
+    meal_planning = any(
+        marker in text
+        for marker in (
+            "午饭",
+            "午餐",
+            "晚饭",
+            "晚餐",
+            "用餐",
+            "餐厅",
+            "吃饭",
+            "菜",
+            "忌口",
+            "包间",
+        )
+    )
+    return {"meal_planning": True} if meal_planning else {}
 
 
-def _resolved_tool_arguments(slots: Mapping[str, str]) -> dict[str, Any]:
-    arguments: dict[str, Any] = {
-        "company_location": slots.get("location_anchor", "Synthetic Central Office"),
-        "days": int(slots.get("days", "2")) if str(slots.get("days", "2")).isdigit() else 2,
-        "time_window": slots.get("time_window", "flexible"),
-    }
+def _resolved_tool_arguments(slots: Mapping[str, Any]) -> dict[str, Any]:
+    arguments: dict[str, Any] = {}
+    if slots.get("location_anchor"):
+        arguments["company_location"] = str(slots["location_anchor"])
+    if slots.get("agenda_duration") and str(slots["agenda_duration"]).isdigit():
+        arguments["days"] = int(str(slots["agenda_duration"]))
+    if slots.get("time_window"):
+        arguments["time_window"] = str(slots["time_window"])
     if slots.get("budget"):
-        budget_digits = re.search(r"\d+", slots["budget"])
+        budget_digits = re.search(r"\d+", str(slots["budget"]))
         if budget_digits:
             arguments["budget_max"] = int(budget_digits.group(0))
     return arguments
 
 
-def _place_search_query(slots: Mapping[str, str]) -> str:
-    location = slots.get("location_anchor", "")
+def _place_search_query(slots: Mapping[str, Any]) -> str:
+    location = str(slots.get("location_anchor", ""))
     cuisine = slots.get("cuisine_preference", "餐厅")
     # Search engines and public map geocoders treat party size / budget as
     # noise.  Keep those as planning constraints and reduce a verbose anchor
@@ -2078,6 +2343,12 @@ def _codex_user_visible_reply(provider_result: Any) -> str:
     """
 
     proposal = getattr(provider_result, "proposal", None)
+    if isinstance(proposal, Mapping) and proposal.get("proposal_type") == "clarification":
+        question_text = proposal.get("question_text")
+        if isinstance(question_text, str):
+            normalized_question = _safe_summary(question_text)
+            if normalized_question:
+                return normalized_question
     candidate = proposal.get("summary") if isinstance(proposal, Mapping) else None
     if isinstance(candidate, str):
         normalized = _safe_summary(candidate)
@@ -2118,7 +2389,7 @@ def _user_facing_final_plan(
     party_size = slots.get("party_size", "人数待最终确认")
     time_window = slots.get("time_window", "具体到店时间待确认")
     budget = slots.get("budget", "预算待确认")
-    dietary = slots.get("dietary_constraints", "忌口待确认")
+    dietary = _display_slot_value(slots.get("dietary_constraints", "忌口待确认"))
     meal_type = slots.get("meal_type", "用餐")
     cuisine = slots.get("cuisine_preference", "餐饮")
     external_results = tool_payload.get("results", []) if isinstance(tool_payload, Mapping) else []
@@ -2155,6 +2426,12 @@ def _user_facing_final_plan(
         f"预算控制在{budget}，优先满足{dietary}，菜系偏好为{cuisine}。\n"
         "当前尚未取得可验证的地点检索结果；请补充像“北京市海淀区中关村领展购物广场附近”这样的明确位置，或在本地 Codex 模式下重试只读地点检索。"
     )
+
+
+def _display_slot_value(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        return "无忌口" if not value else "、".join(str(item) for item in value)
+    return str(value)
 
 
 def _user_facing_current_plan(

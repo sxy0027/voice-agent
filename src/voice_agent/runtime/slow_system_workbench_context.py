@@ -9,9 +9,13 @@ import hashlib
 import json
 from typing import Any
 
+from voice_agent.slowtask.clarification_policy import plan_clarification
+from voice_agent.slowtask.slot_ledger import build_slot_ledger, updates_from_evidence_catalog
+from voice_agent.slowtask.task_schema import customer_reception_schema, evaluate_requirements
 from voice_agent.state.slowtask_state import SlowTaskRecord, SlowTaskState
 from voice_agent.state.task_focus_state import TaskFocusState
 from voice_agent.state.tool_execution_state import ToolExecutionState
+from voice_agent.tools.demo_manifests import mvp2_demo_tool_manifests
 
 
 TASK_CONTEXT_PACK_SCHEMA_VERSION = "workbench.task_context_pack.v1"
@@ -42,6 +46,9 @@ class TaskContextPack:
     resolved_arguments: Mapping[str, Any]
     missing_fields: tuple[str, ...]
     conflicting_fields: tuple[str, ...]
+    slot_summary: tuple[Mapping[str, Any], ...]
+    readiness: Mapping[str, bool]
+    clarification: Mapping[str, Any] | None
     plan_history: tuple[Mapping[str, Any], ...]
     accepted_evidence_refs: tuple[str, ...]
     accepted_evidence_summaries: tuple[Mapping[str, Any], ...]
@@ -67,6 +74,9 @@ class TaskContextPack:
             "resolved_arguments": deepcopy(dict(self.resolved_arguments)),
             "missing_fields": list(self.missing_fields),
             "conflicting_fields": list(self.conflicting_fields),
+            "slot_summary": deepcopy(list(self.slot_summary)),
+            "readiness": deepcopy(dict(self.readiness)),
+            "clarification": deepcopy(dict(self.clarification)) if self.clarification is not None else None,
             "plan_history": deepcopy(list(self.plan_history)),
             "accepted_evidence_refs": list(self.accepted_evidence_refs),
             "accepted_evidence_summaries": deepcopy(list(self.accepted_evidence_summaries)),
@@ -115,6 +125,13 @@ class TaskContextPackBuilder:
                 "resolved_arguments": {},
                 "missing_fields": [],
                 "conflicting_fields": [],
+                "slot_summary": [],
+                "readiness": {
+                    "search": False,
+                    "plan": False,
+                    "commitment": False,
+                },
+                "clarification": None,
                 "plan_history": [],
                 "accepted_evidence_refs": [],
                 "accepted_evidence_summaries": [],
@@ -139,6 +156,35 @@ class TaskContextPackBuilder:
             evidence_catalog=evidence_catalog,
             current_plan_version=current_plan_version,
         )
+        schema = customer_reception_schema(
+            tool_required_arguments={
+                manifest.tool_name: manifest.required_arguments
+                for manifest in mvp2_demo_tool_manifests()
+            }
+        )
+        ledger = build_slot_ledger(
+            updates_from_evidence_catalog(evidence_catalog, task_id=task.task_id),
+            asked_counts=_asked_count_map_from_task(task),
+        )
+        task_features = _task_features_from_catalog(evidence_catalog, task_id=task.task_id)
+        assessment = evaluate_requirements(schema=schema, ledger=ledger, task_features=task_features)
+        clarification = plan_clarification(
+            schema=schema,
+            ledger=ledger,
+            assessment=assessment,
+            clarification_id="projection_current_clarification",
+        )
+        spec_map = schema.slots_by_name
+        required_for = {
+            spec.name: list(spec.required_for_tools)
+            for spec in schema.slots
+        }
+        slot_summary = []
+        for row in ledger.summary({name: spec.label for name, spec in spec_map.items()}):
+            normalized = dict(row)
+            normalized["required_for"] = required_for.get(str(row.get("name", "")), [])
+            slot_summary.append(normalized)
+
         missing_fields, conflicting_fields = (
             _missing_and_conflicting_fields(task)
             if task.lifecycle_state == "WAITING_FOR_SLOT"
@@ -179,6 +225,9 @@ class TaskContextPackBuilder:
             "resolved_arguments": resolved_arguments,
             "missing_fields": list(missing_fields),
             "conflicting_fields": list(conflicting_fields),
+            "slot_summary": slot_summary,
+            "readiness": dict(assessment.ready_for),
+            "clarification": clarification.to_dict() if clarification is not None else None,
             "plan_history": plan_history,
             "accepted_evidence_refs": [item["evidence_ref"] for item in accepted],
             "accepted_evidence_summaries": accepted,
@@ -236,6 +285,9 @@ def _pack_from_payload(payload: Mapping[str, Any]) -> TaskContextPack:
         resolved_arguments=normalized["resolved_arguments"],
         missing_fields=tuple(str(field) for field in normalized["missing_fields"]),
         conflicting_fields=tuple(str(field) for field in normalized["conflicting_fields"]),
+        slot_summary=tuple(normalized["slot_summary"]),
+        readiness=normalized["readiness"],
+        clarification=normalized["clarification"],
         plan_history=tuple(normalized["plan_history"]),
         accepted_evidence_refs=tuple(str(ref) for ref in normalized["accepted_evidence_refs"]),
         accepted_evidence_summaries=tuple(normalized["accepted_evidence_summaries"]),
@@ -259,6 +311,41 @@ def _active_or_last_task(state: SlowTaskState) -> SlowTaskRecord | None:
     if state.last_task_id is not None:
         return state.tasks.get(state.last_task_id)
     return None
+
+
+def _asked_count_map_from_task(task: SlowTaskRecord) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in task.evidence_events:
+        if event.event_name != "CLARIFICATION_REQUESTED":
+            continue
+        for field in event.refs:
+            counts[field] = counts.get(field, 0) + 1
+    return counts
+
+
+def _task_features_from_catalog(
+    evidence_catalog: Mapping[str, Mapping[str, Any]],
+    *,
+    task_id: str,
+) -> dict[str, Any]:
+    meal_markers = (
+        "午饭",
+        "午餐",
+        "晚饭",
+        "晚餐",
+        "用餐",
+        "餐厅",
+        "吃饭",
+        "菜",
+        "忌口",
+        "包间",
+    )
+    text = " ".join(
+        str(item.get("summary", ""))
+        for item in evidence_catalog.values()
+        if str(item.get("task_id", "")) == task_id and not bool(item.get("stale"))
+    )
+    return {"meal_planning": any(marker in text for marker in meal_markers)}
 
 
 def _catalog_evidence(
@@ -304,11 +391,13 @@ def _catalog_evidence(
 def _missing_and_conflicting_fields(task: SlowTaskRecord) -> tuple[tuple[str, ...], tuple[str, ...]]:
     missing: list[str] = []
     conflicting: list[str] = []
-    for event in task.evidence_events:
-        if event.event_name in {"WAITING_FOR_SLOT", "INSUFFICIENT_EVIDENCE_FOR_ACTION", "CLARIFICATION_REQUESTED"}:
+    for event in reversed(task.evidence_events):
+        if not missing and event.event_name in {"WAITING_FOR_SLOT", "INSUFFICIENT_EVIDENCE_FOR_ACTION", "CLARIFICATION_REQUESTED"}:
             missing.extend(ref for ref in event.refs if _field_like(ref))
-        if event.event_name == "AMBIGUITY_DETECTED":
+        if not conflicting and event.event_name == "AMBIGUITY_DETECTED":
             conflicting.extend(ref for ref in event.refs if _field_like(ref))
+        if missing and conflicting:
+            break
     return _unique_strings(missing), _unique_strings(conflicting)
 
 

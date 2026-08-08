@@ -50,23 +50,33 @@ WORKBENCH_SAFE_FIELD_NAMES = frozenset(
         "time_window",
         "location_anchor",
         "party_size",
+        "agenda_duration",
         "budget",
         "dietary_constraints",
-        "private_room_or_quiet_space",
+        "cuisine_preference",
+        "meal_type",
+        "private_room",
         "invoice_needed",
         "parking_needed",
+        "transport_needed",
+        "guest_profile",
     }
 )
-WORKBENCH_REQUIRED_PLANNING_FIELDS = ("location_anchor", "time_window")
+WORKBENCH_REQUIRED_PLANNING_FIELDS = ("time_window", "location_anchor", "party_size")
 USER_FACING_FIELD_LABELS = {
     "time_window": "用餐日期与具体时段",
     "location_anchor": "明确的位置锚点",
     "party_size": "用餐人数",
+    "agenda_duration": "接待或行程时长",
     "budget": "预算范围",
     "dietary_constraints": "忌口与饮食限制",
-    "private_room_or_quiet_space": "是否需要包间或安静环境",
+    "cuisine_preference": "菜系偏好",
+    "meal_type": "用餐类型",
+    "private_room": "是否需要包间或安静环境",
     "invoice_needed": "是否需要发票",
     "parking_needed": "是否需要停车",
+    "transport_needed": "是否需要接送或交通安排",
+    "guest_profile": "客户画像或接待偏好",
 }
 
 
@@ -557,6 +567,38 @@ class CodexSlowLLMAdapter:
             trace_items.append(repaired_trace)
             await _emit_provider_progress(on_progress, repaired_trace)
 
+        selected_ask_fields = tuple(state_missing_fields)
+        model_missing_fields = _normalize_missing_fields(normalized.get("missing_fields", ()))
+        if selected_ask_fields and set(model_missing_fields) != set(selected_ask_fields):
+            validation_failed_event = validation_failed_event or self._boundary.append_adapter_event(
+                event_name="ADAPTER_OUTPUT_VALIDATION_FAILED",
+                event_id=f"{event_id_prefix}_backend_ask_field_mismatch",
+                source_module="slow_llm_adapter",
+                caused_by_event_id=str(slowtask_event["event_id"]),
+                created_monotonic_ms=created_monotonic_ms + len(trace_items) + 1,
+                created_wall_clock_ms=created_wall_clock_ms + len(trace_items) + 1,
+                trace_redaction_level="metadata_only",
+                adapter_id=self._adapter_id,
+                adapter_type=CODEX_SLOW_LLM_ADAPTER_TYPE,
+                adapter_request_id=adapter_request_id,
+                task_id=task_id,
+                plan_version=plan_version,
+                task_event_seq=task_event_seq,
+                schema_name="voice_agent.slowtask.structured_output.v1",
+                failure_reasons=["backend_selected_ask_fields_mismatch"],
+                output_mode="degraded",
+            )
+            output_mode = "degraded"
+            degraded_reason = "backend_selected_ask_fields_mismatch"
+            normalized = dict(normalized)
+            normalized["diagnostic_model_missing_fields"] = list(model_missing_fields)
+            normalized["missing_fields"] = list(selected_ask_fields)
+            task_analysis = dict(normalized.get("task_analysis", {}))
+            task_analysis["summary"] = _clarification_question_text(selected_ask_fields)
+            task_analysis["intent"] = "clarify_backend_selected_fields"
+            task_analysis["confidence"] = "medium"
+            normalized["task_analysis"] = task_analysis
+
         metadata = build_qwen_slow_llm_structured_output_metadata(
             normalized,
             expected_binding=binding,
@@ -981,18 +1023,16 @@ def _fake_structured_output(
     normalized_missing = _normalize_missing_fields(missing_fields)
     args_status = "partial" if normalized_missing else "candidate_ready"
     tool_args = {
-        "company_location": "Synthetic Central Office",
-        "days": 2,
-        "time_window": "flexible",
+        "company_location": None,
+        "days": None,
+        "time_window": None,
     }
     return {
         "schema_version": QWEN_SLOW_LLM_EVIDENCE_SCHEMA_VERSION,
         "task_binding": binding.to_dict(),
         "task_analysis": {
             "summary": (
-                "我已读取当前任务，但继续规划前还需要补充："
-                + "、".join(USER_FACING_FIELD_LABELS.get(field, field) for field in normalized_missing)
-                + "。请直接提供这些信息，我会据此继续处理。"
+                _clarification_question_text(normalized_missing)
                 if normalized_missing
                 else "信息已经足够。我会先按当前时间、地点和偏好准备候选方案；这些候选只用于演示和后续确认，不会自动预订或外发。"
             ),
@@ -1054,6 +1094,15 @@ def _proposal_from_structured_output(
     known_fields = _normalize_field_list(output.get("known_fields", []))
     missing_fields = _normalize_missing_fields(output.get("missing_fields", []))
     normalized_state_missing_fields = _normalize_missing_fields(state_missing_fields or ())
+    diagnostic_model_missing_fields = _normalize_missing_fields(
+        output.get("diagnostic_model_missing_fields", missing_fields)
+    )
+    backend_selected_ask_fields = normalized_state_missing_fields or missing_fields
+    covered_fields = backend_selected_ask_fields if backend_selected_ask_fields else ()
+    fields_match_backend = (
+        not normalized_state_missing_fields
+        or set(diagnostic_model_missing_fields) == set(normalized_state_missing_fields)
+    )
     candidate_tool_name = str(tool_proposal.get("tool_name", "demo.itinerary.search"))
     tool_name = (
         candidate_tool_name
@@ -1065,13 +1114,13 @@ def _proposal_from_structured_output(
         safe_hint = _bounded_model_text(item, fallback="")
         if safe_hint:
             risk_hints.append(safe_hint)
-    if set(normalized_state_missing_fields) != set(missing_fields):
+    if not fields_match_backend:
         risk_hints.append(
             "Codex 对缺失信息的判断与后端当前状态不完全一致；展示时以 proposal 为候选，是否推进仍以后端状态为准。"
         )
-    if missing_fields:
+    if backend_selected_ask_fields:
         readable_missing_fields = "、".join(
-            USER_FACING_FIELD_LABELS.get(field, field) for field in missing_fields
+            USER_FACING_FIELD_LABELS.get(field, field) for field in backend_selected_ask_fields
         )
         suggested_next_steps = [
             f"先请用户补充：{readable_missing_fields}。",
@@ -1091,13 +1140,22 @@ def _proposal_from_structured_output(
     )
     return {
         "proposal_id": f"proposal_{str(output['task_binding']['adapter_request_id'])}",
-        "proposal_type": "clarification" if missing_fields else "tool_preview",
-        "status": "validated",
+        "proposal_type": "clarification" if backend_selected_ask_fields else "tool_preview",
+        "status": "validated" if fields_match_backend else "degraded",
         # ``task_analysis.summary`` is the adapter's bounded, user-visible
         # realization candidate.  The session decides whether the current
         # SlowTask state permits displaying it; Codex still cannot mutate facts
         # or authorize a tool.
         "summary": analysis_summary,
+        "clarification_id": f"clarification_{str(output['task_binding']['adapter_request_id'])}",
+        "question_text": (
+            _clarification_question_text(backend_selected_ask_fields)
+            if backend_selected_ask_fields
+            else ""
+        ),
+        "covered_fields": list(covered_fields),
+        "backend_selected_ask_fields": list(backend_selected_ask_fields),
+        "diagnostic_model_missing_fields": list(diagnostic_model_missing_fields),
         "suggested_next_steps": suggested_next_steps,
         "known_fields": list(known_fields),
         "missing_fields": list(missing_fields),
@@ -1145,6 +1203,22 @@ def _bounded_model_text(value: object, *, fallback: str, max_length: int = 320) 
     ):
         return fallback
     return normalized[:max_length]
+
+
+def _clarification_question_text(fields: Sequence[str]) -> str:
+    normalized = _normalize_missing_fields(fields)
+    if not normalized:
+        return "信息已经足够，我会继续处理当前计划。"
+    labels = [USER_FACING_FIELD_LABELS.get(field, field) for field in normalized]
+    if set(normalized) == {"time_window", "location_anchor", "party_size"}:
+        return "为了继续规划客户接待，请告诉我接待时间、位置锚点和大概人数。"
+    if set(normalized) == {"budget", "dietary_constraints"}:
+        return "用餐安排还需要确认两点：预算范围是多少，客人有没有忌口或饮食限制？"
+    if "time_window" in normalized and len(normalized) == 1:
+        return "时间还不够具体。请告诉我是星期几，以及上午、下午还是晚上。"
+    if len(labels) <= 2:
+        return "继续前还需要确认：" + "、".join(labels) + "。"
+    return "继续前还需要确认：" + "、".join(labels[:3]) + "。"
 
 
 def _normalize_missing_fields(value: object) -> tuple[str, ...]:
@@ -1250,10 +1324,10 @@ def _infer_known_fields_from_context(task_context_pack: Mapping[str, Any]) -> tu
         add("party_size")
     if re.search(r"(人均\s*)?\d+\s*(元|块|以内|以下)", text):
         add("budget")
-    if any(marker in text for marker in ("不吃辣", "忌口", "过敏", "清淡", "素食", "没有其他忌口")):
+    if any(marker in text for marker in ("不吃辣", "忌口", "过敏", "清淡", "素食", "没有其他忌口", "无忌口", "没有忌口")):
         add("dietary_constraints")
     if any(marker in text for marker in ("包间", "安静", "商务环境")):
-        add("private_room_or_quiet_space")
+        add("private_room")
     if "发票" in text:
         add("invoice_needed")
     if "停车" in text:
@@ -1298,6 +1372,9 @@ def _build_codex_prompt(
         "current_goal": task_context_pack.get("current_goal"),
         "current_constraints": task_context_pack.get("current_constraints", []),
         "resolved_arguments": task_context_pack.get("resolved_arguments", {}),
+        "slot_summary": task_context_pack.get("slot_summary", []),
+        "readiness": task_context_pack.get("readiness", {}),
+        "clarification": task_context_pack.get("clarification"),
         "backend_missing_hint": task_context_pack.get("missing_fields", []),
         "conflicting_fields": task_context_pack.get("conflicting_fields", []),
         "recent_interaction_summary": task_context_pack.get("recent_interaction_summary", []),
@@ -1314,10 +1391,10 @@ def _build_codex_prompt(
         "Write every user-visible summary, intent, and risk hint in clear Simplified Chinese. "
         "task_analysis.summary is a direct user-facing reply candidate, not hidden reasoning: "
         "acknowledge only constraints present in task_context, state only the current SlowTask status, "
-        "and give concrete next questions. You must infer known_fields and missing_fields from "
-        "the visible user constraints, resolved arguments, evidence summaries, and recent interaction. "
-        "task_context.backend_missing_hint is only a backend state hint for comparison; do not copy it "
-        "blindly. When information is missing, ask using user language; never expose internal enum names. "
+        "and give concrete next questions. task_context.clarification.ask_fields is authoritative: "
+        "when present, ask exactly those fields, include no extra fields, and put the same fields in "
+        "missing_fields. Any additional model-inferred gaps are diagnostic only. When information is "
+        "missing, ask using user language; never expose internal enum names. "
         "Do not invent restaurants, availability, prices, bookings, tool results, or completed actions.\n"
         + json.dumps(
             {
@@ -1335,9 +1412,9 @@ def _build_codex_prompt(
 def _codex_output_schema_json() -> str:
     arguments_schema = _strict_json_object(
         {
-            "company_location": {"type": "string"},
-            "days": {"type": "integer"},
-            "time_window": {"type": "string"},
+            "company_location": {"type": ["string", "null"]},
+            "days": {"type": ["integer", "null"]},
+            "time_window": {"type": ["string", "null"]},
         }
     )
     empty_arguments_schema = _strict_json_object({})
