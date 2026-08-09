@@ -76,6 +76,11 @@ export type ConversationTurn = Readonly<{
   text: string;
   owner: Owner;
   note: string;
+  turnId?: string;
+  sourceRole?: string;
+  proposalId?: string;
+  contextHash?: string;
+  causedByEventId?: string;
 }>;
 
 export type PlanVersionSnapshot = Readonly<{
@@ -109,6 +114,22 @@ export type SlotSummaryItem = Readonly<{
   askedCount: number;
 }>;
 
+export type RequirementSummaryItem = Readonly<{
+  requirementId: string;
+  label: string;
+  description: string;
+  sourceRoute: "USER" | "TOOL" | "DERIVED" | "SYSTEM" | "OPTIONAL";
+  requiredAt: "search" | "plan" | "commitment" | null;
+  status: SlotSummaryItem["state"] | "NOT_APPLICABLE";
+  proposedStatus?: SlotSummaryItem["state"] | "NOT_APPLICABLE";
+  acceptedStatus?: SlotSummaryItem["state"] | "NOT_APPLICABLE";
+  valuePreview: string;
+  sourceEvidenceRefs?: readonly string[];
+  rejectionReason?: string | null;
+  requirementModelVersion?: number | null;
+  toolBindings: readonly string[];
+}>;
+
 export type ReadinessSummary = Readonly<{
   search: boolean;
   plan: boolean;
@@ -134,6 +155,21 @@ export type SlowTaskSnapshot = Readonly<{
   slotSummary?: readonly SlotSummaryItem[];
   readiness?: ReadinessSummary;
   clarification?: ClarificationSummary;
+  taskRequirementModelRef?: string | null;
+  taskRequirementModelVersion?: number | null;
+  taskKind?: string | null;
+  taskModelStatus?: string | null;
+  taskModelConfidence?: string | null;
+  taskModelBootstrapReason?: string | null;
+  taskModelNeedsRemodeling?: boolean;
+  taskComponents?: readonly string[];
+  requirementSummary?: readonly RequirementSummaryItem[];
+  currentRole?: string | null;
+  priorRoleProposalRefs?: readonly string[];
+  selectedClarificationRequirementIds?: readonly string[];
+  plannerMode?: string | null;
+  currentPlanProposalRef?: string | null;
+  reviewerStatus?: string | null;
   pendingConfirmation?: PendingConfirmation;
   semanticCommitmentStatus: "not_emitted_yet" | "emitted_by_slowtask";
   staleEvidencePolicy: string;
@@ -274,6 +310,7 @@ export type SlowSystemScenario = Readonly<{
   slowTask: SlowTaskSnapshot;
   timeline: readonly SlowTaskTimelineEvent[];
   liveProgress: readonly WorkbenchProgressWire[];
+  roleInvocations?: readonly WorkbenchProgressWire[];
   streaming: WorkbenchStreamingWire;
   evidence: readonly EvidenceItem[];
   staleEvidence: readonly EvidenceItem[];
@@ -323,6 +360,7 @@ export type WorkbenchProgressWire = Readonly<{
   canonical: false;
   task_id?: string | null;
   plan_version?: number | null;
+  task_event_seq?: number | null;
   created_monotonic_ms?: number | null;
   tool_name?: string | null;
   proposal_only?: boolean | null;
@@ -340,6 +378,15 @@ export type WorkbenchProgressWire = Readonly<{
   tool_output_summary?: string | null;
   next_step?: string | null;
   blocked_on_user?: boolean | null;
+  role?: string | null;
+  proposal_id?: string | null;
+  context_hash?: string | null;
+  public_summary?: string | null;
+  validation_status?: string | null;
+  degraded_reason?: string | null;
+  next_role?: string | null;
+  accepted?: boolean | null;
+  rejected?: boolean | null;
 }>;
 
 export type WorkbenchStreamingWire = Readonly<{
@@ -362,6 +409,21 @@ export type WorkbenchTaskWire = Readonly<{
   slot_summary?: readonly Readonly<Record<string, unknown>>[];
   readiness?: Readonly<Record<string, unknown>>;
   clarification?: Readonly<Record<string, unknown>> | null;
+  task_requirement_model_ref?: string | null;
+  task_requirement_model_version?: number | null;
+  task_kind?: string | null;
+  task_model_status?: string | null;
+  task_model_confidence?: string | null;
+  task_model_bootstrap_reason?: string | null;
+  task_model_needs_remodeling?: boolean;
+  task_components?: readonly string[];
+  requirement_summary?: readonly Readonly<Record<string, unknown>>[];
+  current_role?: string | null;
+  prior_role_proposal_refs?: readonly string[];
+  selected_clarification_requirement_ids?: readonly string[];
+  planner_mode?: string | null;
+  current_plan_proposal_ref?: string | null;
+  reviewer_status?: string | null;
   plan_versions: readonly Readonly<Record<string, unknown>>[];
   evidence: readonly WorkbenchEvidenceWire[];
   stale_evidence: readonly WorkbenchEvidenceWire[];

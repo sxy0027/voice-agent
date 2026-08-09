@@ -160,6 +160,95 @@ class MockSlowTaskRuntime:
             produced_events=tuple(produced_events),
         )
 
+    def accept_task_requirement_model(
+        self,
+        *,
+        task_id: str,
+        plan_version: int,
+        task_event_seq: int,
+        caused_by_event_id: str,
+        event_id: str,
+        created_monotonic_ms: int,
+        created_wall_clock_ms: int,
+        model_payload: Mapping[str, Any],
+        source_proposal_ref: str,
+        accepted_context_hash: str,
+    ) -> Mapping[str, Any]:
+        return self._append_slowtask_event(
+            event_name="TASK_REQUIREMENT_MODEL_ACCEPTED",
+            event_id=event_id,
+            caused_by_event_id=caused_by_event_id,
+            created_monotonic_ms=created_monotonic_ms,
+            created_wall_clock_ms=created_wall_clock_ms,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=task_event_seq,
+            model_id=str(model_payload["model_id"]),
+            model_version=int(model_payload["model_version"]),
+            task_kind=str(model_payload["task_kind"]),
+            model_ref=f"requirement-model://{task_id}/{model_payload['model_id']}/v{model_payload['model_version']}",
+            source_proposal_ref=source_proposal_ref,
+            accepted_context_hash=accepted_context_hash,
+            model_status=str(model_payload["model_status"]),
+            model_confidence=str(model_payload["model_confidence"]),
+            bootstrap_reason=model_payload.get("bootstrap_reason") or "not_applicable",
+            needs_remodeling=bool(model_payload["needs_remodeling"]),
+            model_payload=dict(model_payload),
+        )
+
+    def invalidate_task_requirement_model(
+        self,
+        *,
+        task_id: str,
+        plan_version: int,
+        task_event_seq: int,
+        caused_by_event_id: str,
+        event_id: str,
+        created_monotonic_ms: int,
+        created_wall_clock_ms: int,
+        model_ref: str,
+        invalidation_reason: str,
+    ) -> Mapping[str, Any]:
+        return self._append_slowtask_event(
+            event_name="TASK_REQUIREMENT_MODEL_INVALIDATED",
+            event_id=event_id,
+            caused_by_event_id=caused_by_event_id,
+            created_monotonic_ms=created_monotonic_ms,
+            created_wall_clock_ms=created_wall_clock_ms,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=task_event_seq,
+            model_ref=model_ref,
+            invalidation_reason=invalidation_reason,
+        )
+
+    def accept_requirement_states(
+        self,
+        *,
+        task_id: str,
+        plan_version: int,
+        task_event_seq: int,
+        caused_by_event_id: str,
+        event_id: str,
+        created_monotonic_ms: int,
+        created_wall_clock_ms: int,
+        evidence_refs: Sequence[str],
+        accepted_requirement_states: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        return self._append_slowtask_event(
+            event_name="EVIDENCE_REVIEWED",
+            event_id=event_id,
+            caused_by_event_id=caused_by_event_id,
+            created_monotonic_ms=created_monotonic_ms,
+            created_wall_clock_ms=created_wall_clock_ms,
+            task_id=task_id,
+            plan_version=plan_version,
+            task_event_seq=task_event_seq,
+            evidence_refs=list(evidence_refs),
+            review_result="accepted_requirement_assessment",
+            accepted_requirement_states=[dict(item) for item in accepted_requirement_states],
+        )
+
     def run_planning_started(
         self,
         *,
@@ -574,6 +663,7 @@ class MockSlowTaskRuntime:
         return_to_state: str = "PLANNING",
         current_resolved_slots: Mapping[str, str] | None = None,
         incoming_slot_values: Mapping[str, str] | None = None,
+        next_task_event_seq: int | None = None,
     ) -> MockSlowTaskRunResult:
         _validate_user_patch_received_event(user_patch_event)
         if not event_id_prefix:
@@ -583,7 +673,14 @@ class MockSlowTaskRuntime:
         patch_id = str(user_patch_event["patch_id"])
         observed_plan_version = _int_field(user_patch_event, "observed_plan_version")
         current_plan_version = _int_field(user_patch_event, "plan_version")
-        next_task_event_seq = _int_field(user_patch_event, "task_event_seq") + 1
+        received_task_event_seq = _int_field(user_patch_event, "task_event_seq")
+        next_task_event_seq = (
+            received_task_event_seq + 1
+            if next_task_event_seq is None
+            else next_task_event_seq
+        )
+        if next_task_event_seq <= received_task_event_seq:
+            raise ValueError("next_task_event_seq must follow USER_PATCH_RECEIVED")
         interpretation_type, materially_changes_task, interpretation_reason = (
             _mock_interpretation_from_user_patch(
                 user_patch_event,

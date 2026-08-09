@@ -63,6 +63,7 @@ function ProgressRow({ item }: Readonly<{ item: WorkbenchProgressWire }>) {
     item.phase,
     item.status,
     item.orchestration_role ? `role=${item.orchestration_role}` : null,
+    item.role ? `role=${item.role}` : null,
     item.subtask_id ? `subtask=${item.subtask_id}` : null,
     item.tool_name ? `tool=${item.tool_name}` : null,
     item.blocked_on_user ? "blocked_on_user=true" : null,
@@ -73,6 +74,11 @@ function ProgressRow({ item }: Readonly<{ item: WorkbenchProgressWire }>) {
   if (item.tool_input_summary) expanded.push(["工具输入", item.tool_input_summary]);
   if (item.tool_output_summary) expanded.push(["工具输出", item.tool_output_summary]);
   if (item.next_step) expanded.push(["下一步", item.next_step]);
+  if (item.public_summary) expanded.push(["角色结果", item.public_summary]);
+  if (item.context_hash) expanded.push(["上下文哈希", item.context_hash]);
+  if (item.validation_status) expanded.push(["校验", item.validation_status]);
+  if (item.degraded_reason) expanded.push(["降级原因", item.degraded_reason]);
+  if (item.next_role) expanded.push(["下一角色", item.next_role]);
   return (
     <li className="live-progress-item">
       <span className="live-progress-index">{String(item.sequence).padStart(2, "0")}</span>

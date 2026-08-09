@@ -29,6 +29,7 @@ class ProviderTraceItem:
     output_mode: str
     task_id: str | None
     plan_version: int | None
+    task_event_seq: int | None = None
     canonical: bool = False
     created_monotonic_ms: int | None = None
     tool_name: str | None = None
@@ -47,6 +48,15 @@ class ProviderTraceItem:
     tool_output_summary: str | None = None
     next_step: str | None = None
     blocked_on_user: bool | None = None
+    role: str | None = None
+    proposal_id: str | None = None
+    context_hash: str | None = None
+    public_summary: str | None = None
+    validation_status: str | None = None
+    degraded_reason: str | None = None
+    next_role: str | None = None
+    accepted: bool | None = None
+    rejected: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -61,6 +71,7 @@ class ProviderTraceItem:
         for field_name, value in (
             ("task_id", self.task_id),
             ("plan_version", self.plan_version),
+            ("task_event_seq", self.task_event_seq),
             ("created_monotonic_ms", self.created_monotonic_ms),
             ("tool_name", self.tool_name),
             ("proposal_only", self.proposal_only),
@@ -78,6 +89,15 @@ class ProviderTraceItem:
             ("tool_output_summary", self.tool_output_summary),
             ("next_step", self.next_step),
             ("blocked_on_user", self.blocked_on_user),
+            ("role", self.role),
+            ("proposal_id", self.proposal_id),
+            ("context_hash", self.context_hash),
+            ("public_summary", self.public_summary),
+            ("validation_status", self.validation_status),
+            ("degraded_reason", self.degraded_reason),
+            ("next_role", self.next_role),
+            ("accepted", self.accepted),
+            ("rejected", self.rejected),
         ):
             if value is not None:
                 result[field_name] = value
@@ -308,6 +328,22 @@ def _public_task(
         "slot_summary": deepcopy(list(context_pack.slot_summary)),
         "readiness": deepcopy(dict(context_pack.readiness)),
         "clarification": deepcopy(dict(context_pack.clarification)) if context_pack.clarification is not None else None,
+        "task_requirement_model_ref": context_pack.task_requirement_model_ref,
+        "task_requirement_model_version": context_pack.task_requirement_model_version,
+        "task_kind": context_pack.task_kind,
+        "task_model_status": task.task_model_status,
+        "task_model_confidence": task.task_model_confidence,
+        "task_model_bootstrap_reason": task.task_model_bootstrap_reason,
+        "task_model_needs_remodeling": task.task_model_needs_remodeling,
+        "task_components": list(context_pack.task_components),
+        "requirement_summary": deepcopy(list(context_pack.requirement_summary)),
+        "current_role": context_pack.current_role,
+        "prior_role_proposal_refs": list(context_pack.prior_role_proposal_refs),
+        "available_tool_manifest_summaries": deepcopy(list(context_pack.available_tool_manifest_summaries)),
+        "selected_clarification_requirement_ids": list(context_pack.selected_clarification_requirement_ids),
+        "planner_mode": context_pack.planner_mode,
+        "current_plan_proposal_ref": context_pack.current_plan_proposal_ref,
+        "reviewer_status": context_pack.reviewer_status,
         "plan_versions": plan_versions,
         "evidence": current_evidence,
         "stale_evidence": stale_evidence,

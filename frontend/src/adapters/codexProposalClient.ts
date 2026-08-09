@@ -16,6 +16,8 @@ import type {
   WorkbenchTaskWire,
   SlotSummaryItem,
   ClarificationSummary,
+  RequirementSummaryItem,
+  WorkbenchProgressWire,
 } from "../slowSystem";
 
 export type CodexProviderMode = "fake" | "codex_cli_local" | "codex_cli_unavailable";
@@ -95,7 +97,7 @@ export async function requestCodexProposal({
     : await createWorkbenchSession({
         provider_mode: providerMode,
         allow_local_codex_cli: allowLocalCodexCli,
-        timeout_seconds: 45,
+        timeout_seconds: 60,
       });
   const resolvedSessionId = created?.sessionId ?? sessionId;
   if (!resolvedSessionId) {
@@ -172,7 +174,7 @@ async function requestCompatibilityProposal({
       source_evidence_refs: scenario.codexProposal.sourceEvidenceRefs,
       provider_mode: providerMode,
       allow_local_codex_cli: allowLocalCodexCli,
-      timeout_seconds: 45,
+      timeout_seconds: 60,
       session_id: sessionId ?? undefined,
       action: sessionId ? undefined : scenario.demoAction,
     }),
@@ -379,8 +381,12 @@ export function workbenchSnapshotToScenario(
     ? toPendingConfirmation(task.pending_confirmation)
     : undefined;
   const conversation = snapshot.conversation.map((item, index) => toConversation(item, index));
+  const currentAssistantTurn = [...conversation].reverse().find(
+    (item) => item.speaker === "system" || item.speaker === "assistant_fast",
+  );
   const timeline = snapshot.timeline.map((item, index) => toTimelineEvent(item, index, snapshot.router));
   const liveProgress = snapshot.live_progress ?? [];
+  const roleInvocations = snapshot.provider_trace.filter((item) => Boolean(item.role)) as WorkbenchProgressWire[];
   const streaming = snapshot.streaming ?? {
     active: false,
     phase: "idle",
@@ -422,6 +428,21 @@ export function workbenchSnapshotToScenario(
       slotSummary: toSlotSummary(task?.slot_summary),
       readiness: toReadiness(task?.readiness),
       clarification: toClarification(task?.clarification),
+      taskRequirementModelRef: task?.task_requirement_model_ref,
+      taskRequirementModelVersion: task?.task_requirement_model_version,
+      taskKind: task?.task_kind,
+      taskModelStatus: task?.task_model_status,
+      taskModelConfidence: task?.task_model_confidence,
+      taskModelBootstrapReason: task?.task_model_bootstrap_reason,
+      taskModelNeedsRemodeling: task?.task_model_needs_remodeling,
+      taskComponents: task?.task_components ?? [],
+      requirementSummary: toRequirementSummary(task?.requirement_summary),
+      currentRole: task?.current_role,
+      priorRoleProposalRefs: task?.prior_role_proposal_refs ?? [],
+      selectedClarificationRequirementIds: task?.selected_clarification_requirement_ids ?? [],
+      plannerMode: task?.planner_mode,
+      currentPlanProposalRef: task?.current_plan_proposal_ref,
+      reviewerStatus: task?.reviewer_status,
       pendingConfirmation,
       semanticCommitmentStatus,
       staleEvidencePolicy: task?.stale_evidence_policy ?? baseScenario.slowTask.staleEvidencePolicy,
@@ -429,13 +450,56 @@ export function workbenchSnapshotToScenario(
     },
     timeline: timeline.length > 0 ? timeline : baseScenario.timeline,
     liveProgress,
+    roleInvocations,
     streaming,
     evidence,
     staleEvidence,
     codexProposal: proposal,
     proposalType: proposal.proposalType,
-    answer: proposal.summary,
+    answer: currentAssistantTurn?.text ?? proposal.summary,
   };
+}
+
+function toRequirementSummary(
+  value: WorkbenchTaskWire["requirement_summary"] | undefined,
+): RequirementSummaryItem[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => ({
+    requirementId: String(item.requirement_id ?? ""),
+    label: String(item.label ?? item.requirement_id ?? ""),
+    description: String(item.description ?? ""),
+    sourceRoute: asSourceRoute(item.source_route),
+    requiredAt: asRequiredAt(item.required_at),
+    status: asRequirementStatus(item.status),
+    proposedStatus: asRequirementStatus(item.proposed_status),
+    acceptedStatus: asRequirementStatus(item.accepted_status),
+    valuePreview: String(item.value_preview ?? ""),
+    sourceEvidenceRefs: Array.isArray(item.source_evidence_refs)
+      ? item.source_evidence_refs.map(String)
+      : [],
+    rejectionReason: item.rejection_reason == null ? null : String(item.rejection_reason),
+    requirementModelVersion: item.requirement_model_version == null
+      ? null
+      : Number(item.requirement_model_version),
+    toolBindings: Array.isArray(item.tool_bindings) ? item.tool_bindings.map(String) : [],
+  }));
+}
+
+function asSourceRoute(value: unknown): RequirementSummaryItem["sourceRoute"] {
+  return value === "TOOL" || value === "DERIVED" || value === "SYSTEM" || value === "OPTIONAL"
+    ? value
+    : "USER";
+}
+
+function asRequiredAt(value: unknown): RequirementSummaryItem["requiredAt"] {
+  return value === "search" || value === "plan" || value === "commitment" ? value : null;
+}
+
+function asRequirementStatus(value: unknown): RequirementSummaryItem["status"] {
+  return value === "CANDIDATE" || value === "RESOLVED" || value === "AMBIGUOUS" ||
+    value === "CONFLICTING" || value === "DEFAULTED" || value === "NOT_APPLICABLE"
+    ? value
+    : "UNKNOWN";
 }
 
 function toSlotSummary(value: WorkbenchTaskWire["slot_summary"] | undefined): SlotSummaryItem[] {
@@ -528,6 +592,11 @@ function toConversation(item: Readonly<Record<string, unknown>>, index: number):
     text: String(item.text ?? item.summary ?? ""),
     owner,
     note: String(item.note ?? "Python-owned session projection."),
+    turnId: item.turn_id == null ? undefined : String(item.turn_id),
+    sourceRole: item.source_role == null ? undefined : String(item.source_role),
+    proposalId: item.proposal_id == null ? undefined : String(item.proposal_id),
+    contextHash: item.context_hash == null ? undefined : String(item.context_hash),
+    causedByEventId: item.caused_by_event_id == null ? undefined : String(item.caused_by_event_id),
   };
 }
 

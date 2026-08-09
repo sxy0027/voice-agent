@@ -26,6 +26,7 @@ accepted register。
 | ADR-014 | webSearch Evidence Boundary for Demo Tools | accepted | MVP-2 / MVP-3 | `docs/adr/ADR-014 webSearch Evidence Boundary for Demo Tools.md` |
 | ADR-015 | Repository Governance and AGENTS.md Rules | accepted | MVP-0 / MVP-1 / MVP-2 / MVP-3 | `docs/adr/ADR-015 Repository Governance and AGENTS.md Rules.md` |
 | ADR-016 | SlowTask Lifecycle and Confirmation State Contract | accepted | MVP-1 / MVP-2 | `docs/adr/ADR-016 SlowTask Lifecycle and Confirmation State Contract.md` |
+| ADR-017 | Role-Based Slow LLM Orchestration and Dynamic Task Requirement Model | accepted | MVP-1 / MVP-2 / MVP-3 | `docs/adr/ADR-017 Role-Based Slow LLM Orchestration and Dynamic Task Requirement Model.md` |
 
 ## 使用规则
 

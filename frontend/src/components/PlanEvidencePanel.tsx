@@ -41,6 +41,8 @@ export function PlanEvidencePanel({
     commitment: false,
   };
   const slotSummary = scenario.slowTask.slotSummary ?? [];
+  const requirements = scenario.slowTask.requirementSummary ?? [];
+  const roleInvocations = scenario.roleInvocations ?? [];
 
   return (
     <section className="panel evidence-panel" aria-labelledby="evidence-heading">
@@ -96,7 +98,20 @@ export function PlanEvidencePanel({
         </div>
         <div>
           <dt>SemanticCommitment</dt>
-          <dd>not emitted yet; owner remains SlowTask</dd>
+          <dd>{scenario.slowTask.semanticCommitmentStatus}; owner remains SlowTask</dd>
+        </div>
+        <div>
+          <dt>task_kind</dt>
+          <dd>{scenario.slowTask.taskKind ?? "pending_model"}</dd>
+        </div>
+        <div>
+          <dt>requirement_model</dt>
+          <dd>
+            {scenario.slowTask.taskRequirementModelRef ?? "not accepted"}
+            {scenario.slowTask.taskRequirementModelVersion
+              ? ` / v${scenario.slowTask.taskRequirementModelVersion}`
+              : ""}
+          </dd>
         </div>
       </dl>
 
@@ -123,9 +138,30 @@ export function PlanEvidencePanel({
         </div>
       ) : null}
 
-      {slotSummary.length > 0 ? (
+      {requirements.length > 0 ? (
         <div className="slot-ledger">
-          <h3>Slot ledger</h3>
+          <h3>Task requirements</h3>
+          <div className="slot-ledger-list">
+            {requirements.map((requirement) => (
+              <article className="slot-ledger-item" data-state={requirement.status} key={requirement.requirementId}>
+                <div>
+                  <strong>{requirement.label}</strong>
+                  <span>{requirement.status} · {requirement.sourceRoute}</span>
+                </div>
+                <p>{requirement.valuePreview || requirement.description}</p>
+                <small>
+                  id={requirement.requirementId}; required_at={requirement.requiredAt ?? "optional"}
+                  {requirement.toolBindings.length > 0
+                    ? `; tool_bindings=${requirement.toolBindings.join(", ")}`
+                    : ""}
+                </small>
+              </article>
+            ))}
+          </div>
+        </div>
+      ) : slotSummary.length > 0 ? (
+        <div className="slot-ledger">
+          <h3>Requirement evidence</h3>
           <div className="slot-ledger-list">
             {slotSummary.map((slot) => (
               <article className="slot-ledger-item" data-state={slot.state} key={slot.name}>
@@ -141,6 +177,26 @@ export function PlanEvidencePanel({
               </article>
             ))}
           </div>
+        </div>
+      ) : null}
+
+      {roleInvocations.length > 0 ? (
+        <div className="plan-version-list">
+          <h3>Role invocations</h3>
+          {roleInvocations.map((invocation) => (
+            <article className="plan-version-item" data-status={invocation.validation_status} key={invocation.trace_id}>
+              <strong>{invocation.role}</strong>
+              <span>{invocation.validation_status ?? invocation.status}</span>
+              <p>{invocation.public_summary ?? invocation.detail ?? "Validated role proposal"}</p>
+              <small>
+                task={invocation.task_id ?? "n/a"}; plan_version={invocation.plan_version ?? "n/a"};
+                proposal_only={String(invocation.proposal_only ?? false)};
+                blocked_on_user={String(invocation.blocked_on_user ?? false)};
+                context={invocation.context_hash ?? "n/a"}; next={invocation.next_role ?? "complete"}
+                {invocation.degraded_reason ? `; degraded=${invocation.degraded_reason}` : ""}
+              </small>
+            </article>
+          ))}
         </div>
       ) : null}
 

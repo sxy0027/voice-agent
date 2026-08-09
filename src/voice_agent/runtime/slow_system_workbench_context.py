@@ -9,13 +9,23 @@ import hashlib
 import json
 from typing import Any
 
-from voice_agent.slowtask.clarification_policy import plan_clarification
-from voice_agent.slowtask.slot_ledger import build_slot_ledger, updates_from_evidence_catalog
-from voice_agent.slowtask.task_schema import customer_reception_schema, evaluate_requirements
+from voice_agent.slowtask.requirement_model import (
+    RequirementStage,
+    assess_requirements,
+    task_requirement_model_from_dict,
+)
+from voice_agent.slowtask.role_orchestrator import select_user_blockers
+from voice_agent.slowtask.slot_ledger import (
+    SlotState,
+    SlotUpdate,
+    build_slot_ledger,
+    updates_from_evidence_catalog,
+)
 from voice_agent.state.slowtask_state import SlowTaskRecord, SlowTaskState
 from voice_agent.state.task_focus_state import TaskFocusState
 from voice_agent.state.tool_execution_state import ToolExecutionState
 from voice_agent.tools.demo_manifests import mvp2_demo_tool_manifests
+from voice_agent.tools.registry import ToolRegistry
 
 
 TASK_CONTEXT_PACK_SCHEMA_VERSION = "workbench.task_context_pack.v1"
@@ -49,6 +59,21 @@ class TaskContextPack:
     slot_summary: tuple[Mapping[str, Any], ...]
     readiness: Mapping[str, bool]
     clarification: Mapping[str, Any] | None
+    task_requirement_model_ref: str | None
+    task_requirement_model_version: int | None
+    task_kind: str | None
+    task_model_status: str | None
+    task_model_confidence: str | None
+    task_model_needs_remodeling: bool
+    task_components: tuple[str, ...]
+    requirement_summary: tuple[Mapping[str, Any], ...]
+    current_role: str | None
+    prior_role_proposal_refs: tuple[str, ...]
+    available_tool_manifest_summaries: tuple[Mapping[str, Any], ...]
+    selected_clarification_requirement_ids: tuple[str, ...]
+    planner_mode: str | None
+    current_plan_proposal_ref: str | None
+    reviewer_status: str | None
     plan_history: tuple[Mapping[str, Any], ...]
     accepted_evidence_refs: tuple[str, ...]
     accepted_evidence_summaries: tuple[Mapping[str, Any], ...]
@@ -77,6 +102,21 @@ class TaskContextPack:
             "slot_summary": deepcopy(list(self.slot_summary)),
             "readiness": deepcopy(dict(self.readiness)),
             "clarification": deepcopy(dict(self.clarification)) if self.clarification is not None else None,
+            "task_requirement_model_ref": self.task_requirement_model_ref,
+            "task_requirement_model_version": self.task_requirement_model_version,
+            "task_kind": self.task_kind,
+            "task_model_status": self.task_model_status,
+            "task_model_confidence": self.task_model_confidence,
+            "task_model_needs_remodeling": self.task_model_needs_remodeling,
+            "task_components": list(self.task_components),
+            "requirement_summary": deepcopy(list(self.requirement_summary)),
+            "current_role": self.current_role,
+            "prior_role_proposal_refs": list(self.prior_role_proposal_refs),
+            "available_tool_manifest_summaries": deepcopy(list(self.available_tool_manifest_summaries)),
+            "selected_clarification_requirement_ids": list(self.selected_clarification_requirement_ids),
+            "planner_mode": self.planner_mode,
+            "current_plan_proposal_ref": self.current_plan_proposal_ref,
+            "reviewer_status": self.reviewer_status,
             "plan_history": deepcopy(list(self.plan_history)),
             "accepted_evidence_refs": list(self.accepted_evidence_refs),
             "accepted_evidence_summaries": deepcopy(list(self.accepted_evidence_summaries)),
@@ -109,6 +149,7 @@ class TaskContextPackBuilder:
         latest_user_input: str | None,
         resolved_argument_values: Mapping[str, Any] | None = None,
         task_created_event_id: str | None = None,
+        role_state: Mapping[str, Any] | None = None,
     ) -> TaskContextPack:
         task = _active_or_last_task(slowtask_state)
         if task is None:
@@ -132,6 +173,21 @@ class TaskContextPackBuilder:
                     "commitment": False,
                 },
                 "clarification": None,
+                "task_requirement_model_ref": None,
+                "task_requirement_model_version": None,
+                "task_kind": None,
+                "task_model_status": None,
+                "task_model_confidence": None,
+                "task_model_needs_remodeling": False,
+                "task_components": [],
+                "requirement_summary": [],
+                "current_role": None,
+                "prior_role_proposal_refs": [],
+                "available_tool_manifest_summaries": _tool_manifest_summaries(),
+                "selected_clarification_requirement_ids": [],
+                "planner_mode": None,
+                "current_plan_proposal_ref": None,
+                "reviewer_status": None,
                 "plan_history": [],
                 "accepted_evidence_refs": [],
                 "accepted_evidence_summaries": [],
@@ -156,34 +212,82 @@ class TaskContextPackBuilder:
             evidence_catalog=evidence_catalog,
             current_plan_version=current_plan_version,
         )
-        schema = customer_reception_schema(
-            tool_required_arguments={
-                manifest.tool_name: manifest.required_arguments
-                for manifest in mvp2_demo_tool_manifests()
-            }
+        tool_registry = ToolRegistry(mvp2_demo_tool_manifests())
+        model = (
+            task_requirement_model_from_dict(task.task_requirement_model, tool_registry=tool_registry)
+            if task.task_requirement_model is not None
+            else None
         )
+        catalog_updates = updates_from_evidence_catalog(evidence_catalog, task_id=task.task_id)
+        if model is not None:
+            tool_requirement_ids = {
+                spec.requirement_id
+                for spec in model.requirements
+                if spec.source_route.value == "TOOL"
+            }
+            catalog_updates = tuple(
+                update
+                for update in catalog_updates
+                if update.name not in tool_requirement_ids
+                or update.plan_version == current_plan_version
+            )
         ledger = build_slot_ledger(
-            updates_from_evidence_catalog(evidence_catalog, task_id=task.task_id),
+            (*catalog_updates, *_recorded_requirement_updates(task, catalog_updates)),
             asked_counts=_asked_count_map_from_task(task),
         )
-        task_features = _task_features_from_catalog(evidence_catalog, task_id=task.task_id)
-        assessment = evaluate_requirements(schema=schema, ledger=ledger, task_features=task_features)
-        clarification = plan_clarification(
-            schema=schema,
-            ledger=ledger,
-            assessment=assessment,
-            clarification_id="projection_current_clarification",
-        )
-        spec_map = schema.slots_by_name
+        assessment = assess_requirements(model=model, ledger=ledger) if model is not None else None
+        selected = select_user_blockers(model=model, ledger=ledger) if model is not None else ()
+        spec_map = model.requirements_by_id if model is not None else {}
         required_for = {
-            spec.name: list(spec.required_for_tools)
-            for spec in schema.slots
+            spec.requirement_id: [f"{binding.tool_name}:{binding.argument_name}" for binding in spec.tool_bindings]
+            for spec in spec_map.values()
         }
+        clarification = None
+        if selected and task.lifecycle_state == "WAITING_FOR_SLOT":
+            blocked_stage = next(
+                (stage.value for stage in RequirementStage if set(selected) & set(assessment.missing_by_stage[stage.value])),
+                RequirementStage.PLAN.value,
+            )
+            clarification = {
+                "clarification_id": "projection_current_clarification",
+                "blocked_stage": blocked_stage,
+                "ask_fields": list(selected),
+                "known_fields": list(ledger.resolved_fields()),
+                "reason": "conflicting" if set(selected) & set(assessment.conflicting) else "ambiguous" if set(selected) & set(assessment.ambiguous) else "missing",
+                "attempt": 1 + max((_asked_count_map_from_task(task).get(item, 0) for item in selected), default=0),
+            }
         slot_summary = []
         for row in ledger.summary({name: spec.label for name, spec in spec_map.items()}):
             normalized = dict(row)
             normalized["required_for"] = required_for.get(str(row.get("name", "")), [])
             slot_summary.append(normalized)
+        requirement_summary = []
+        for spec in model.requirements if model is not None else ():
+            record = ledger.records.get(spec.requirement_id)
+            proposed_status = record.state.value if record is not None else "UNKNOWN"
+            accepted_status = task.requirement_states.get(spec.requirement_id, proposed_status)
+            requirement_summary.append(
+                {
+                    "requirement_id": spec.requirement_id,
+                    "label": spec.label,
+                    "description": spec.description,
+                    "source_route": spec.source_route.value,
+                    "required_at": spec.required_at.value if spec.required_at else None,
+                    "proposed_status": proposed_status,
+                    "accepted_status": accepted_status,
+                    "status": accepted_status,
+                    "value_preview": record.value_preview() if record is not None else "",
+                    "source_evidence_refs": (
+                        [item.evidence_ref for item in record.provenance[-4:]]
+                        if record is not None
+                        else list(task.requirement_state_evidence_refs.get(spec.requirement_id, ()))
+                    ),
+                    "rejection_reason": None,
+                    "requirement_model_version": task.task_requirement_model_version,
+                    "tool_bindings": required_for.get(spec.requirement_id, []),
+                }
+            )
+        role_state = dict(role_state or {})
 
         missing_fields, conflicting_fields = (
             _missing_and_conflicting_fields(task)
@@ -226,8 +330,23 @@ class TaskContextPackBuilder:
             "missing_fields": list(missing_fields),
             "conflicting_fields": list(conflicting_fields),
             "slot_summary": slot_summary,
-            "readiness": dict(assessment.ready_for),
-            "clarification": clarification.to_dict() if clarification is not None else None,
+            "readiness": dict(assessment.ready_for) if assessment is not None else {"search": False, "plan": False, "commitment": False},
+            "clarification": clarification,
+            "task_requirement_model_ref": task.task_requirement_model_ref,
+            "task_requirement_model_version": task.task_requirement_model_version,
+            "task_kind": task.task_kind,
+            "task_model_status": task.task_model_status,
+            "task_model_confidence": task.task_model_confidence,
+            "task_model_needs_remodeling": task.task_model_needs_remodeling,
+            "task_components": list(model.task_components) if model is not None else [],
+            "requirement_summary": requirement_summary,
+            "current_role": role_state.get("current_role"),
+            "prior_role_proposal_refs": list(role_state.get("prior_role_proposal_refs", ())),
+            "available_tool_manifest_summaries": _tool_manifest_summaries(),
+            "selected_clarification_requirement_ids": list(selected),
+            "planner_mode": role_state.get("planner_mode"),
+            "current_plan_proposal_ref": role_state.get("current_plan_proposal_ref"),
+            "reviewer_status": role_state.get("reviewer_status"),
             "plan_history": plan_history,
             "accepted_evidence_refs": [item["evidence_ref"] for item in accepted],
             "accepted_evidence_summaries": accepted,
@@ -288,6 +407,21 @@ def _pack_from_payload(payload: Mapping[str, Any]) -> TaskContextPack:
         slot_summary=tuple(normalized["slot_summary"]),
         readiness=normalized["readiness"],
         clarification=normalized["clarification"],
+        task_requirement_model_ref=normalized["task_requirement_model_ref"],
+        task_requirement_model_version=normalized["task_requirement_model_version"],
+        task_kind=normalized["task_kind"],
+        task_model_status=normalized["task_model_status"],
+        task_model_confidence=normalized["task_model_confidence"],
+        task_model_needs_remodeling=bool(normalized["task_model_needs_remodeling"]),
+        task_components=tuple(normalized["task_components"]),
+        requirement_summary=tuple(normalized["requirement_summary"]),
+        current_role=normalized["current_role"],
+        prior_role_proposal_refs=tuple(normalized["prior_role_proposal_refs"]),
+        available_tool_manifest_summaries=tuple(normalized["available_tool_manifest_summaries"]),
+        selected_clarification_requirement_ids=tuple(normalized["selected_clarification_requirement_ids"]),
+        planner_mode=normalized["planner_mode"],
+        current_plan_proposal_ref=normalized["current_plan_proposal_ref"],
+        reviewer_status=normalized["reviewer_status"],
         plan_history=tuple(normalized["plan_history"]),
         accepted_evidence_refs=tuple(str(ref) for ref in normalized["accepted_evidence_refs"]),
         accepted_evidence_summaries=tuple(normalized["accepted_evidence_summaries"]),
@@ -323,29 +457,18 @@ def _asked_count_map_from_task(task: SlowTaskRecord) -> dict[str, int]:
     return counts
 
 
-def _task_features_from_catalog(
-    evidence_catalog: Mapping[str, Mapping[str, Any]],
-    *,
-    task_id: str,
-) -> dict[str, Any]:
-    meal_markers = (
-        "午饭",
-        "午餐",
-        "晚饭",
-        "晚餐",
-        "用餐",
-        "餐厅",
-        "吃饭",
-        "菜",
-        "忌口",
-        "包间",
-    )
-    text = " ".join(
-        str(item.get("summary", ""))
-        for item in evidence_catalog.values()
-        if str(item.get("task_id", "")) == task_id and not bool(item.get("stale"))
-    )
-    return {"meal_planning": any(marker in text for marker in meal_markers)}
+def _tool_manifest_summaries() -> list[dict[str, Any]]:
+    return [
+        {
+            "tool_name": manifest.tool_name,
+            "required_arguments": list(manifest.required_arguments),
+            "optional_arguments": list(manifest.optional_arguments),
+            "side_effect_class": manifest.side_effect_class,
+            "risk_class": manifest.risk_class,
+            "trust_level": manifest.trust_level,
+        }
+        for manifest in mvp2_demo_tool_manifests()
+    ]
 
 
 def _catalog_evidence(
@@ -535,6 +658,30 @@ def _recent_interactions(conversation: Sequence[Mapping[str, Any]]) -> list[dict
             }
         )
     return result
+
+
+def _recorded_requirement_updates(
+    task: SlowTaskRecord,
+    catalog_updates: Sequence[SlotUpdate],
+) -> tuple[SlotUpdate, ...]:
+    catalog_names = {update.name for update in catalog_updates}
+    result: list[SlotUpdate] = []
+    for requirement_id, status in task.requirement_states.items():
+        if requirement_id in catalog_names or status in {"UNKNOWN", "NOT_APPLICABLE"}:
+            continue
+        refs = task.requirement_state_evidence_refs.get(requirement_id, ())
+        result.append(
+            SlotUpdate(
+                name=requirement_id,
+                normalized_value=None,
+                raw_evidence="recorded requirement state",
+                state=SlotState(status),
+                evidence_ref=refs[0] if refs else "evidence://journal/requirement-state",
+                source="event_journal_replay",
+                plan_version=task.current_plan_version,
+            )
+        )
+    return tuple(result)
 
 
 def _prompt_preview(payload: Mapping[str, Any]) -> str:

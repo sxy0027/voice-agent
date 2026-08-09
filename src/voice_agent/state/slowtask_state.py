@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 
@@ -16,6 +17,8 @@ SLOWTASK_EVENT_NAMES = frozenset(
         "USER_PATCH_INTERPRETED",
         "PLAN_VERSION_ADVANCED",
         "TASK_REPLANNED",
+        "TASK_REQUIREMENT_MODEL_ACCEPTED",
+        "TASK_REQUIREMENT_MODEL_INVALIDATED",
         "EVIDENCE_REVIEWED",
         "AMBIGUITY_DETECTED",
         "AMBIGUITY_RESOLVED",
@@ -276,6 +279,17 @@ class SlowTaskRecord:
     initial_goal_ref: str
     source_evidence_refs: tuple[str, ...] = ()
     constraints_ref: str | None = None
+    task_requirement_model_ref: str | None = None
+    task_requirement_model_version: int | None = None
+    task_kind: str | None = None
+    task_requirement_model: Mapping[str, Any] | None = None
+    task_model_status: str | None = None
+    task_model_confidence: str | None = None
+    task_model_bootstrap_reason: str | None = None
+    task_model_needs_remodeling: bool = False
+    invalidated_requirement_model_refs: tuple[str, ...] = ()
+    requirement_states: dict[str, str] = field(default_factory=dict)
+    requirement_state_evidence_refs: dict[str, tuple[str, ...]] = field(default_factory=dict)
     user_patch_evidence: tuple[UserPatchEvidence, ...] = ()
     user_patch_interpretations: tuple[UserPatchInterpretation, ...] = ()
     state_transitions: tuple[StateTransition, ...] = ()
@@ -340,6 +354,10 @@ class SlowTaskState:
             self._handle_user_patch_received(event, task)
         elif event_name == "USER_PATCH_INTERPRETED":
             self._handle_user_patch_interpreted(event, task)
+        elif event_name == "TASK_REQUIREMENT_MODEL_ACCEPTED":
+            self._handle_requirement_model_accepted(event, task)
+        elif event_name == "TASK_REQUIREMENT_MODEL_INVALIDATED":
+            self._handle_requirement_model_invalidated(event, task)
         elif event_name in {
             "TASK_REPLANNED",
             "PLANNING_STARTED",
@@ -481,6 +499,49 @@ class SlowTaskState:
                 task.cancel_reason = str(event["reason"])
             if to_state == "FAILED" and task.failure_reason is None:
                 task.failure_reason = str(event["reason"])
+
+    def _handle_requirement_model_accepted(
+        self, event: Mapping[str, Any], task: SlowTaskRecord
+    ) -> None:
+        self._require_current_plan(event, task)
+        payload = event.get("model_payload")
+        if not isinstance(payload, Mapping):
+            raise SlowTaskStateError("TASK_REQUIREMENT_MODEL_ACCEPTED requires model_payload object")
+        model_ref = str(event["model_ref"])
+        if task.task_requirement_model_ref is not None and task.task_requirement_model_ref != model_ref:
+            raise SlowTaskStateError("accepted requirement model must be invalidated before replacement")
+        task.task_requirement_model_ref = model_ref
+        task.task_requirement_model_version = _int_field(event, "model_version")
+        task.task_kind = str(event["task_kind"])
+        task.task_requirement_model = dict(payload)
+        task.task_model_status = str(event["model_status"])
+        task.task_model_confidence = str(event["model_confidence"])
+        bootstrap_reason = _optional_str(event.get("bootstrap_reason"))
+        task.task_model_bootstrap_reason = (
+            None if bootstrap_reason == "not_applicable" else bootstrap_reason
+        )
+        task.task_model_needs_remodeling = bool(event["needs_remodeling"])
+        self._advance_task_event_seq(task, event)
+
+    def _handle_requirement_model_invalidated(
+        self, event: Mapping[str, Any], task: SlowTaskRecord
+    ) -> None:
+        self._require_current_plan(event, task)
+        model_ref = str(event["model_ref"])
+        if task.task_requirement_model_ref != model_ref:
+            raise SlowTaskStateError("TASK_REQUIREMENT_MODEL_INVALIDATED must reference current model")
+        task.invalidated_requirement_model_refs = (*task.invalidated_requirement_model_refs, model_ref)
+        task.task_requirement_model_ref = None
+        task.task_requirement_model_version = None
+        task.task_kind = None
+        task.task_requirement_model = None
+        task.task_model_status = None
+        task.task_model_confidence = None
+        task.task_model_bootstrap_reason = None
+        task.task_model_needs_remodeling = False
+        task.requirement_states.clear()
+        task.requirement_state_evidence_refs.clear()
+        self._advance_task_event_seq(task, event)
 
     def _handle_plan_version_advanced(self, event: Mapping[str, Any], task: SlowTaskRecord) -> None:
         from_plan_version = _int_field(event, "from_plan_version")
@@ -631,6 +692,22 @@ class SlowTaskState:
             refs = _string_tuple(event.get("evidence_refs", ()))
             _require_stale_evidence_adopted_for_advancement(task, event, refs=refs)
             reason = str(event["review_result"])
+            accepted_states = event.get("accepted_requirement_states", ())
+            if isinstance(accepted_states, Sequence) and not isinstance(accepted_states, (str, bytes)):
+                for item in accepted_states:
+                    if not isinstance(item, Mapping):
+                        raise SlowTaskStateError("accepted_requirement_states must contain objects")
+                    requirement_id = str(item.get("requirement_id", ""))
+                    status = str(item.get("status", ""))
+                    if not requirement_id or status not in {
+                        "UNKNOWN", "CANDIDATE", "RESOLVED", "AMBIGUOUS", "CONFLICTING",
+                        "NOT_APPLICABLE", "DEFAULTED",
+                    }:
+                        raise SlowTaskStateError("invalid accepted requirement state")
+                    task.requirement_states[requirement_id] = status
+                    task.requirement_state_evidence_refs[requirement_id] = _string_tuple(
+                        item.get("source_evidence_refs", ())
+                    )
         elif event_name == "AMBIGUITY_DETECTED":
             refs = (*_string_tuple(event.get("ambiguous_fields", ())), *_string_tuple(event.get("source_evidence_refs", ())))
             _require_stale_evidence_adopted_for_advancement(task, event, refs=refs)

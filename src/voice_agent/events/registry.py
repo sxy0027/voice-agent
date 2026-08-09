@@ -152,7 +152,6 @@ MVP0_EVENT_DEFINITIONS: dict[str, EventDefinition] = {
         ),
         literal_fields={
             "adapter_type": "slow_llm",
-            "schema_name": "voice_agent.slowtask.structured_output.v1",
             "normalization_status": "normalized",
         },
     ),
@@ -403,6 +402,35 @@ MVP1_EVENT_DEFINITIONS: dict[str, EventDefinition] = {
     "TASK_REPLANNED": _definition(
         "TASK_REPLANNED",
         required_fields=("task_id", "plan_version", "task_event_seq", "planning_reason"),
+    ),
+    "TASK_REQUIREMENT_MODEL_ACCEPTED": _definition(
+        "TASK_REQUIREMENT_MODEL_ACCEPTED",
+        required_fields=(
+            "task_id",
+            "plan_version",
+            "task_event_seq",
+            "model_id",
+            "model_version",
+            "task_kind",
+            "model_ref",
+            "source_proposal_ref",
+            "accepted_context_hash",
+            "model_status",
+            "model_confidence",
+            "bootstrap_reason",
+            "needs_remodeling",
+            "model_payload",
+        ),
+    ),
+    "TASK_REQUIREMENT_MODEL_INVALIDATED": _definition(
+        "TASK_REQUIREMENT_MODEL_INVALIDATED",
+        required_fields=(
+            "task_id",
+            "plan_version",
+            "task_event_seq",
+            "model_ref",
+            "invalidation_reason",
+        ),
     ),
     "EVIDENCE_REVIEWED": _definition(
         "EVIDENCE_REVIEWED",

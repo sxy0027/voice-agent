@@ -834,6 +834,7 @@ async def _run_codex_cli_async(
     prompt: str,
     *,
     on_provider_event: ProviderProgressCallback | None = None,
+    output_schema_json: str | None = None,
 ) -> tuple[str, str]:
     # Codex CLI 0.141+ defines --output-schema as a FILE argument, not as an
     # inline JSON string. Keep the schema in a short-lived local file so the
@@ -843,7 +844,7 @@ async def _run_codex_cli_async(
         schema_path = Path(schema_dir) / "output_schema.json"
         await asyncio.to_thread(
             schema_path.write_text,
-            _codex_output_schema_json(),
+            output_schema_json or _codex_output_schema_json(),
             encoding="utf-8",
         )
         command = [
@@ -884,7 +885,13 @@ async def _run_codex_cli_async(
             await process.wait()
             raise
         if process.returncode != 0:
-            raise CodexSlowLLMAdapterError(_classify_stderr(stderr.decode("utf-8", errors="replace")))
+            diagnostic_text = "\n".join(
+                (
+                    stderr.decode("utf-8", errors="replace"),
+                    stdout.decode("utf-8", errors="replace"),
+                )
+            )
+            raise CodexSlowLLMAdapterError(_classify_stderr(diagnostic_text))
         if len(stdout) > CODEX_MAX_STDOUT_BYTES:
             raise CodexSlowLLMAdapterError("provider stdout exceeded bounded adapter limit")
         return (
@@ -1566,6 +1573,10 @@ def _safe_provider_label(value: str) -> str:
 
 def _classify_stderr(stderr: str) -> str:
     lowered = stderr.lower()
+    if "invalid_json_schema" in lowered or "invalid schema" in lowered:
+        return "provider_output_schema_invalid"
+    if "model" in lowered and ("not supported" in lowered or "unsupported" in lowered):
+        return "provider_model_unsupported"
     if "login" in lowered or "auth" in lowered or "unauthorized" in lowered:
         return "provider_auth_unavailable"
     if "not found" in lowered or "no such file" in lowered:

@@ -2,6 +2,9 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
+import { workbenchSnapshotToScenario } from "./adapters/codexProposalClient";
+import { slowSystemScenarios } from "./mockScenarios";
+import type { WorkbenchSnapshotWire } from "./slowSystem";
 
 afterEach(() => {
   cleanup();
@@ -9,6 +12,53 @@ afterEach(() => {
 });
 
 describe("App", () => {
+  it("projects the current conversation reply instead of a stale latest proposal summary", () => {
+    const base = slowSystemScenarios[0];
+    const staleProposal = {
+      ...base.codexProposal,
+      proposalId: "proposal_turn_1",
+      summary: "继续规划前，请补充最终产出、最重要约束。",
+    };
+    const snapshot = {
+      snapshot_id: "snapshot_turn_2",
+      session_id: "frontend_current_turn_binding",
+      mode: "text_first_python_owned",
+      router: null,
+      task: null,
+      conversation: [
+        {
+          id: "assistant_turn_2",
+          speaker: "system",
+          text: "已记录当前条件；仅剩具体日期待确认。",
+          source_role: "CLARIFIER",
+          proposal_id: "proposal_turn_2",
+          context_hash: "sha256:turn-2",
+          turn_id: "turn_2",
+        },
+      ],
+      timeline: [],
+      provider_trace: [],
+      live_progress: [],
+      streaming: { active: false, phase: "complete", label: "完成", detail: "", sequence: 2 },
+      codex_proposals: [],
+      context_pack: {},
+      context_hash: "sha256:snapshot-turn-2",
+      prompt_preview: "redacted",
+      timing_summary: {},
+      capability_snapshot: {},
+      capability_matrices: [],
+      replay: {},
+      safety: {},
+    } as unknown as WorkbenchSnapshotWire;
+
+    const projected = workbenchSnapshotToScenario(snapshot, "第二轮输入", base, staleProposal);
+
+    expect(projected.answer).toBe("已记录当前条件；仅剩具体日期待确认。");
+    expect(projected.answer).not.toBe(staleProposal.summary);
+    expect(projected.conversation[0].proposalId).toBe("proposal_turn_2");
+    expect(projected.conversation[0].contextHash).toBe("sha256:turn-2");
+  });
+
   it("renders the interactive mocklist with Router and SlowTask ownership", () => {
     render(<App />);
 

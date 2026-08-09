@@ -12,7 +12,7 @@ the event journal remain the source of truth.
 import asyncio
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import re
 from typing import Any
@@ -21,9 +21,13 @@ from voice_agent.access.text_ingress import receive_text_input
 from voice_agent.adapters.capabilities import AdapterCapability
 from voice_agent.adapters.codex_slow_llm import (
     CODEX_PROVIDER_MODES,
-    CodexSlowLLMAdapter,
     CodexSlowLLMAdapterConfig,
     build_codex_slow_llm_capability,
+)
+from voice_agent.adapters.codex_roles import (
+    CodexRoleAdapter,
+    RoleInvocationResult,
+    make_codex_cli_role_invoker,
 )
 from voice_agent.adapters.mock_adapters import mvp0_mock_adapter_capabilities
 from voice_agent.adapters.workbench_place_search import WorkbenchPlaceSearchAdapter
@@ -45,25 +49,27 @@ from voice_agent.runtime.slow_system_workbench_snapshots import (
     WorkbenchSnapshot,
     project_workbench_snapshot,
 )
-from voice_agent.slowtask.clarification_policy import (
-    ClarificationPlan,
-    asked_count_map_from_events,
-    plan_clarification,
-)
 from voice_agent.slowtask.mock_runtime import MockSlowTaskRuntime
+from voice_agent.slowtask.requirement_model import (
+    RequirementAssessment,
+    RequirementSourceRoute,
+    RequirementStage,
+    TaskRequirementModel,
+    assess_requirements,
+    task_requirement_model_from_dict,
+)
+from voice_agent.slowtask.role_orchestrator import (
+    PlanReviewResult,
+    RoleRun,
+    SlowLLMRoleOrchestrator,
+    select_user_blockers,
+)
 from voice_agent.slowtask.slot_ledger import (
     SlotLedger,
     SlotState,
     SlotUpdate,
     build_slot_ledger,
     updates_from_evidence_catalog,
-)
-from voice_agent.slowtask.task_schema import (
-    RequirementAssessment,
-    RequirementStage,
-    TaskSchema,
-    customer_reception_schema,
-    evaluate_requirements,
 )
 from voice_agent.state.slowtask_state import SlowTaskRecord, SlowTaskState
 from voice_agent.state.task_focus_state import TaskFocusState
@@ -83,7 +89,7 @@ WORKBENCH_CAPABILITY_SNAPSHOT_REF = "capability://workbench/slow-system-v1"
 WORKBENCH_CAPABILITY_VERSION = "workbench.slow-system.v1"
 WORKBENCH_DEFAULT_PROVIDER_MODE = "codex_cli_local"
 WORKBENCH_DEFAULT_ALLOW_LOCAL_CODEX_CLI = True
-WORKBENCH_DEFAULT_CODEX_MODEL = "5.5"
+WORKBENCH_DEFAULT_CODEX_MODEL: str | None = None
 WORKBENCH_DEFAULT_CODEX_REASONING_EFFORT = "high"
 SAFE_TEXT_MAX_LENGTH = 1200
 SAFE_SUMMARY_MAX_LENGTH = 320
@@ -101,7 +107,7 @@ class WorkbenchRuntimeConfig:
     provider_mode: str = WORKBENCH_DEFAULT_PROVIDER_MODE
     allow_local_codex_cli: bool = WORKBENCH_DEFAULT_ALLOW_LOCAL_CODEX_CLI
     codex_bin: str = "codex"
-    timeout_seconds: int = 30
+    timeout_seconds: int = 60
     model_name: str | None = WORKBENCH_DEFAULT_CODEX_MODEL
     reasoning_effort: str | None = WORKBENCH_DEFAULT_CODEX_REASONING_EFFORT
     max_repair_attempts: int = 2
@@ -123,7 +129,7 @@ class WorkbenchRuntimeConfig:
                 value.get("allow_local_codex_cli", WORKBENCH_DEFAULT_ALLOW_LOCAL_CODEX_CLI)
             ),
             codex_bin=str(value.get("codex_bin", "codex")),
-            timeout_seconds=int(value.get("timeout_seconds", 30)),
+            timeout_seconds=int(value.get("timeout_seconds", 60)),
             model_name=None if model_name in (None, "") else str(model_name),
             reasoning_effort=None if reasoning_effort in (None, "") else str(reasoning_effort),
             max_repair_attempts=int(value.get("max_repair_attempts", 2)),
@@ -148,7 +154,7 @@ class WorkbenchRuntimeConfig:
                 "provider_mode": provider_mode,
                 "allow_local_codex_cli": allow,
                 "codex_bin": os.environ.get("VOICE_AGENT_CODEX_BIN", "codex"),
-                "timeout_seconds": os.environ.get("VOICE_AGENT_CODEX_TIMEOUT_SECONDS", "30"),
+                "timeout_seconds": os.environ.get("VOICE_AGENT_CODEX_TIMEOUT_SECONDS", "60"),
                 "model_name": os.environ.get("VOICE_AGENT_CODEX_MODEL", WORKBENCH_DEFAULT_CODEX_MODEL),
                 "reasoning_effort": os.environ.get(
                     "VOICE_AGENT_CODEX_REASONING_EFFORT",
@@ -156,6 +162,16 @@ class WorkbenchRuntimeConfig:
                 ),
             }
         )
+
+
+@dataclass(frozen=True)
+class _DynamicClarificationPlan:
+    clarification_id: str
+    blocked_stage: str
+    ask_fields: tuple[str, ...]
+    known_fields: tuple[str, ...]
+    reason: str
+    attempt: int
 
 
 @dataclass
@@ -203,7 +219,11 @@ class WorkbenchSession:
 
     @property
     def codex_capability(self) -> Mapping[str, Any]:
-        return self._codex_adapter.capability
+        return build_codex_slow_llm_capability(
+            provider_mode=self._config.provider_mode,
+            allow_local_codex_cli=self._config.allow_local_codex_cli,
+            model_name=self._config.model_name,
+        )
 
     async def snapshot(self) -> dict[str, Any]:
         if self._lock.locked():
@@ -287,7 +307,7 @@ class WorkbenchSession:
                 result = {
                     "status": result["status"],
                     "assistant_summary": (
-                        "上一份方案已经完成；我已将这条修改作为新的修订任务处理，并沿用已记录的人数、地点、预算、忌口与菜系约束。"
+                        "上一份方案已经完成；我已将这条修改作为新的修订任务处理，并只沿用仍与当前目标相关的已接受条件。"
                         + result["assistant_summary"]
                     ),
                 }
@@ -364,6 +384,11 @@ class WorkbenchSession:
                 "summary": result["assistant_summary"],
                 "owner": "slowtask" if resolved_action == "repeat_completed_plan" else "router" if decision == "FAST_ONLY" else "slowtask",
                 "source": "python_workbench",
+                "turn_id": turn.get("turn_id"),
+                "source_role": result.get("user_visible_source_role", "PYTHON_DETERMINISTIC"),
+                "proposal_id": result.get("user_visible_proposal_id"),
+                "context_hash": result.get("user_visible_context_hash"),
+                "caused_by_event_id": result.get("user_visible_caused_by_event_id"),
                 "note": "该文本是状态摘要；任务事实仍由 event journal / reducer 投影拥有。",
             }
         )
@@ -410,8 +435,14 @@ class WorkbenchSession:
         self._last_user_input: str | None = None
         self._resolved_argument_values: dict[str, Any] = {}
         self._slot_values: dict[str, Any] = {}
-        self._task_features: dict[str, Any] = {}
-        self._task_schema = self._customer_reception_schema()
+        self._role_state: dict[str, Any] = {
+            "current_role": None,
+            "prior_role_proposal_refs": [],
+            "planner_mode": None,
+            "current_plan_proposal_ref": None,
+            "reviewer_status": None,
+        }
+        self._remodel_context_hashes: set[str] = set()
         # This is a presentation cache of a SemanticCommitment-backed answer.
         # It never advances a plan or replaces the event-journal projection.
         self._last_completed_plan_summary: str | None = None
@@ -439,22 +470,35 @@ class WorkbenchSession:
         )
         self._journal = startup.journal
         self._boundary = AdapterCallbackAppendBoundary(self._journal)
-        self._codex_adapter = CodexSlowLLMAdapter(
-            boundary=self._boundary,
-            config=CodexSlowLLMAdapterConfig(
-                provider_mode=self._config.provider_mode,
-                allow_local_codex_cli=self._config.allow_local_codex_cli,
-                codex_bin=self._config.codex_bin,
-                timeout_seconds=self._config.timeout_seconds,
-                model_name=self._config.model_name,
-                reasoning_effort=self._config.reasoning_effort,
-                max_repair_attempts=self._config.max_repair_attempts,
-            ),
+        self._codex_config = CodexSlowLLMAdapterConfig(
+            provider_mode=self._config.provider_mode,
+            allow_local_codex_cli=self._config.allow_local_codex_cli,
+            codex_bin=self._config.codex_bin,
+            timeout_seconds=self._config.timeout_seconds,
+            model_name=self._config.model_name,
+            reasoning_effort=self._config.reasoning_effort,
+            max_repair_attempts=self._config.max_repair_attempts,
         )
+        self._tool_registry = ToolRegistry(mvp2_demo_tool_manifests())
         self._tool_executor = DemoToolExecutor(
             journal=self._journal,
-            registry=ToolRegistry(mvp2_demo_tool_manifests()),
+            registry=self._tool_registry,
             backend=InMemoryDemoBackend(),
+        )
+        self._role_adapter = CodexRoleAdapter(
+            boundary=self._boundary,
+            tool_registry=self._tool_registry,
+            provider_mode="fake" if self._config.provider_mode == "fake" else self._config.provider_mode,
+            provider_invoker=(
+                make_codex_cli_role_invoker(self._codex_config)
+                if self._config.provider_mode == "codex_cli_local"
+                and self._config.allow_local_codex_cli
+                else None
+            ),
+        )
+        self._role_orchestrator = SlowLLMRoleOrchestrator(
+            adapter=self._role_adapter,
+            tool_registry=self._tool_registry,
         )
         self._place_search_adapter = WorkbenchPlaceSearchAdapter()
         self._slowtask_runtime = MockSlowTaskRuntime(self._journal)
@@ -566,12 +610,6 @@ class WorkbenchSession:
     ) -> dict[str, str]:
         task_id = self._next_id("task")
         evidence_ref = self._next_ref("evidence", "user")
-        initial_slot_updates = _extract_workbench_slot_updates(
-            text,
-            evidence_ref=evidence_ref,
-            plan_version=1,
-            source="user_text",
-        )
         self._record_evidence(
             evidence_ref,
             task_id=task_id,
@@ -580,9 +618,7 @@ class WorkbenchSession:
             summary=text,
             source="user_text",
             trust_level="authoritative_user_evidence",
-            slot_updates=initial_slot_updates,
         )
-        self._task_features.update(_extract_workbench_task_features(text))
         prefix = self._next_id("spawn")
         created = self._slowtask_runtime.create_from_router_spawn(
             router_decision_event=router_event,
@@ -612,80 +648,49 @@ class WorkbenchSession:
             created_wall_clock_ms=self._clock.wall_clock_ms,
             start_task_event_seq=3,
         )
-        planning_event = planning.produced_events[0]
-        self._merge_slot_values(text)
-        assessment = self._requirement_assessment(task_id)
-        clarification = self._clarification_plan(
+        run = self._role_orchestrator.new_task_run()
+        model, modeler = await self._run_task_modeler(
+            run=run,
             task_id=task_id,
-            clarification_id=self._next_id("clarification"),
-        )
-        blocking_fields = clarification.ask_fields if clarification is not None else ()
-        if clarification is not None:
-            review = self._slowtask_runtime.review_evidence(
-                task_id=task_id,
-                plan_version=1,
-                caused_by_event_id=str(planning_event["event_id"]),
-                event_id_prefix=self._next_id("missing_slot_review"),
-                created_monotonic_ms=self._clock.monotonic_ms,
-                created_wall_clock_ms=self._clock.wall_clock_ms,
-                start_task_event_seq=5,
-                evidence_refs=(evidence_ref,),
-                required_fields=tuple(self._task_schema.slots_by_name),
-                resolved_fields=self._slot_ledger_for_task(task_id).resolved_fields(),
-                ambiguous_fields=tuple((*assessment.ambiguous_fields, *assessment.conflicting_fields)),
-                missing_fields=blocking_fields if clarification.reason == "missing" else (),
-                clarification_prompt_ref=self._next_ref("prompt", "missing_slots"),
-                resolution_reason=f"schema_requirement_{clarification.reason}",
-            )
-            evidence_reviewed_event = next(
-                event for event in review.produced_events if event["event_name"] == "EVIDENCE_REVIEWED"
-            )
-            provider_result = await self._call_codex(
-                intent=text,
-                slowtask_event=evidence_reviewed_event,
-                source_evidence_refs=(evidence_ref,),
-                state_missing_fields_hint=blocking_fields,
-            )
-            self._codex_proposals.append(provider_result.proposal)
-            codex_ref = self._next_ref("evidence", "codex")
-            self._record_evidence(
-                codex_ref,
-                task_id=task_id,
-                plan_version=1,
-                label="Codex clarification proposal",
-                summary="Codex 只生成了追问建议；SlowTask 保持 WAITING_FOR_SLOT，不启动工具。",
-                source="codex_adapter",
-                trust_level="evidence_candidate_only",
-            )
-            return {
-                "status": "waiting_for_slot",
-                "assistant_summary": _codex_user_visible_reply(provider_result),
-            }
-        provider_result = await self._call_codex(
             intent=text,
-            slowtask_event=planning_event,
+            caused_by_event_id=str(planning.produced_events[-1]["event_id"]),
             source_evidence_refs=(evidence_ref,),
-            state_missing_fields_hint=(),
         )
-        codex_ref = self._next_ref("evidence", "codex")
-        self._record_evidence(
-            codex_ref,
+        self._track_role_result(modeler, next_role="REQUIREMENT_ANALYST")
+        task_state, _, _ = self._projections()
+        task = task_state.tasks[task_id]
+        accepted_event = self._slowtask_runtime.accept_task_requirement_model(
             task_id=task_id,
-            plan_version=1,
-            label="Codex structured proposal",
-            summary="Codex 只返回了经过 schema 校验的 proposal candidate；不拥有 SlowTask facts。",
-            source="codex_adapter",
-            trust_level="evidence_candidate_only",
+            plan_version=task.current_plan_version,
+            task_event_seq=task.current_task_event_seq + 1,
+            caused_by_event_id=str(modeler.structured_output_event["event_id"]),
+            event_id=self._next_id("task_requirement_model_accepted"),
+            created_monotonic_ms=self._clock.monotonic_ms,
+            created_wall_clock_ms=self._clock.wall_clock_ms,
+            model_payload=model.to_dict(),
+            source_proposal_ref=modeler.proposal_ref,
+            accepted_context_hash=model.accepted_context_hash,
         )
-        self._codex_proposals.append(provider_result.proposal)
-        started = self._review_and_start_itinerary_tool(
+        updates, analyst = await self._run_requirement_analyst(
+            run=run,
             task_id=task_id,
-            caused_by_event_id=str(provider_result.structured_output_event["event_id"]),
-            evidence_refs=(evidence_ref, codex_ref),
+            intent=text,
+            evidence_ref=evidence_ref,
+            caused_by_event_id=str(accepted_event["event_id"]),
         )
-        started = _with_codex_user_visible_reply(started, provider_result)
-        return await self._maybe_auto_publish_ready_plan(
-            started=started,
+        self._accept_requirement_updates(evidence_ref=evidence_ref, updates=updates)
+        self._record_requirement_state_acceptance(
+            task_id=task_id,
+            updates=updates,
+            caused_by_event_id=str(analyst.structured_output_event["event_id"]),
+        )
+        self._track_role_result(analyst, next_role="CLARIFIER_OR_PLANNER")
+        return await self._advance_after_requirement_analysis(
+            run=run,
+            task_id=task_id,
+            intent=text,
+            caused_by_event_id=str(analyst.structured_output_event["event_id"]),
+            evidence_refs=(evidence_ref,),
             router_event=router_event,
         )
 
@@ -709,18 +714,17 @@ class WorkbenchSession:
         # v1's missing fields from replacing a value that v1 already owns.
         patch_id = self._next_id("patch")
         evidence_ref = self._next_ref("evidence", "patch")
-        pre_patch_slots = dict(self._slot_values)
-        incoming_slot_updates = (
-            _extract_workbench_slot_updates(
-                text,
-                evidence_ref=evidence_ref,
-                plan_version=task.current_plan_version,
-                source="user_patch",
-            )
-            if patch_kind == "material"
-            else ()
+        pre_patch_slots = self._slot_ledger_for_task(task.task_id).value_map(resolved_only=False)
+        suggested_kind = self._role_adapter.fake_task_kind_for_intent(text)
+        goal_rewrite = bool(
+            patch_kind == "material"
+            and suggested_kind is not None
+            and task.task_kind is not None
+            and suggested_kind != task.task_kind
+            and not task.task_model_needs_remodeling
         )
-        incoming_slot_values = _slot_value_map(incoming_slot_updates)
+        if goal_rewrite:
+            candidate_patch_types = ("goal_rewrite_candidate",)
         patch_result = self._user_patch_runtime.receive_patch_from_router_decision(
             router_decision_event=router_event,
             turn_committed_event=turn,
@@ -747,14 +751,89 @@ class WorkbenchSession:
             summary=text,
             source="user_patch",
             trust_level="authoritative_user_evidence",
-            slot_updates=incoming_slot_updates,
         )
+        current_context_hash = self._context_pack().context_hash
+        remodel_model = bool(
+            patch_kind == "material"
+            and not goal_rewrite
+            and task.task_model_needs_remodeling
+            and current_context_hash not in self._remodel_context_hashes
+        )
+        if remodel_model:
+            self._remodel_context_hashes.add(current_context_hash)
+        run = (
+            self._role_orchestrator.new_task_run()
+            if goal_rewrite or remodel_model
+            else self._role_orchestrator.patch_run()
+        )
+        incoming_slot_updates: tuple[SlotUpdate, ...] = ()
+        if remodel_model:
+            task_state, _, _ = self._projections()
+            current_task = task_state.tasks[task.task_id]
+            if current_task.task_requirement_model_ref is None:
+                raise ValueError("provisional model remodeling requires an accepted model")
+            previous_model_version = current_task.task_requirement_model_version or 1
+            invalidated = self._slowtask_runtime.invalidate_task_requirement_model(
+                task_id=current_task.task_id,
+                plan_version=current_task.current_plan_version,
+                task_event_seq=current_task.current_task_event_seq + 1,
+                caused_by_event_id=str(patch_result.user_patch_event["event_id"]),
+                event_id=self._next_id("task_requirement_model_invalidated"),
+                created_monotonic_ms=self._clock.monotonic_ms,
+                created_wall_clock_ms=self._clock.wall_clock_ms,
+                model_ref=current_task.task_requirement_model_ref,
+                invalidation_reason="bounded_context_remodeling",
+            )
+            model, modeler = await self._run_task_modeler(
+                run=run,
+                task_id=current_task.task_id,
+                intent=text,
+                caused_by_event_id=str(invalidated["event_id"]),
+                source_evidence_refs=tuple(self._context_pack().accepted_evidence_refs),
+            )
+            model = replace(model, model_version=previous_model_version + 1)
+            self._track_role_result(modeler, next_role="REQUIREMENT_ANALYST")
+            task_state, _, _ = self._projections()
+            current_task = task_state.tasks[task.task_id]
+            accepted = self._slowtask_runtime.accept_task_requirement_model(
+                task_id=current_task.task_id,
+                plan_version=current_task.current_plan_version,
+                task_event_seq=current_task.current_task_event_seq + 1,
+                caused_by_event_id=str(modeler.structured_output_event["event_id"]),
+                event_id=self._next_id("task_requirement_model_accepted"),
+                created_monotonic_ms=self._clock.monotonic_ms,
+                created_wall_clock_ms=self._clock.wall_clock_ms,
+                model_payload=model.to_dict(),
+                source_proposal_ref=modeler.proposal_ref,
+                accepted_context_hash=model.accepted_context_hash,
+            )
+            incoming_slot_updates, analyst = await self._run_requirement_analyst(
+                run=run,
+                task_id=current_task.task_id,
+                intent=text,
+                evidence_ref=evidence_ref,
+                caused_by_event_id=str(accepted["event_id"]),
+            )
+            self._accept_requirement_updates(evidence_ref=evidence_ref, updates=incoming_slot_updates)
+            self._track_role_result(analyst, next_role="CLARIFIER_OR_PLANNER")
+        elif patch_kind == "material" and not goal_rewrite:
+            incoming_slot_updates, analyst = await self._run_requirement_analyst(
+                run=run,
+                task_id=task.task_id,
+                intent=text,
+                evidence_ref=evidence_ref,
+                caused_by_event_id=str(patch_result.user_patch_event["event_id"]),
+            )
+            self._accept_requirement_updates(evidence_ref=evidence_ref, updates=incoming_slot_updates)
+            self._track_role_result(analyst, next_role="CLARIFIER_OR_PLANNER")
+        incoming_slot_values = _slot_value_map(incoming_slot_updates)
         if patch_kind == "material":
             self._slot_values.update(incoming_slot_values)
-            self._task_features.update(_extract_workbench_task_features(text))
         handle = self._handle_for_task(task.task_id)
         if handle is not None:
             handle.record_task_event(patch_result.user_patch_event)
+        task_state, _, _ = self._projections()
+        interpretation_task_event_seq = task_state.tasks[task.task_id].current_task_event_seq + 1
         interpretation = self._slowtask_runtime.interpret_user_patch(
             user_patch_event=patch_result.user_patch_event,
             event_id_prefix=self._next_id("patch_interpretation"),
@@ -765,6 +844,7 @@ class WorkbenchSession:
             prompt_ref=self._next_ref("prompt", "cancel") if patch_kind == "cancel" else None,
             current_resolved_slots=pre_patch_slots,
             incoming_slot_values=incoming_slot_values,
+            next_task_event_seq=interpretation_task_event_seq,
         )
         self._label_user_patch_evidence(
             evidence_ref,
@@ -773,6 +853,14 @@ class WorkbenchSession:
         if handle is not None:
             for event in interpretation.produced_events:
                 handle.record_task_event(event)
+
+        accepted_state_event = self._record_requirement_state_acceptance(
+            task_id=task.task_id,
+            updates=incoming_slot_updates,
+            caused_by_event_id=str(interpretation.produced_events[-1]["event_id"]),
+        )
+        if handle is not None and accepted_state_event is not None:
+            handle.record_task_event(accepted_state_event)
 
         if patch_kind == "cancel":
             return {
@@ -788,104 +876,70 @@ class WorkbenchSession:
             ),
             None,
         )
-        if restarted is None:
-            # Completing previously absent slots keeps the same plan_version.
-            # It does, however, allow a WAITING_FOR_SLOT task to resume
-            # planning and start its first current-plan lookup.
+        analysis_cause = str(interpretation.produced_events[-1]["event_id"])
+        if goal_rewrite:
             task_state, _, _ = self._projections()
             current_task = task_state.tasks[task.task_id]
-            clarification = self._clarification_plan(task_id=current_task.task_id)
-            if current_task.lifecycle_state == "WAITING_FOR_SLOT" and clarification is None:
-                resumed = self._slowtask_runtime.run_planning_started(
-                    task_id=current_task.task_id,
-                    plan_version=current_task.current_plan_version,
-                    caused_by_event_id=str(current_task.last_slowtask_event_id),
-                    event_id_prefix=self._next_id("slot_resolution_planning"),
-                    created_monotonic_ms=self._clock.monotonic_ms,
-                    created_wall_clock_ms=self._clock.wall_clock_ms,
-                    start_task_event_seq=current_task.current_task_event_seq + 1,
-                    from_state="WAITING_FOR_SLOT",
-                    planning_reason="previously_missing_slots_resolved_without_plan_replacement",
-                )
-                provider_result = await self._call_codex(
-                    intent=text,
-                    slowtask_event=resumed.produced_events[0],
-                    source_evidence_refs=(evidence_ref,),
-                    state_missing_fields_hint=(),
-                )
-                self._codex_proposals.append(provider_result.proposal)
-                codex_ref = self._next_ref("evidence", "codex")
-                self._record_evidence(
-                    codex_ref,
-                    task_id=current_task.task_id,
-                    plan_version=current_task.current_plan_version,
-                    label="Codex slot-resolution proposal",
-                    summary="Codex 基于补齐后的当前计划生成 proposal candidate；不推进 plan_version。",
-                    source="codex_adapter",
-                    trust_level="evidence_candidate_only",
-                )
-                started = self._review_and_start_itinerary_tool(
-                    task_id=current_task.task_id,
-                    caused_by_event_id=str(provider_result.structured_output_event["event_id"]),
-                    evidence_refs=(evidence_ref, codex_ref),
-                )
-                started = _with_codex_user_visible_reply(started, provider_result)
-                return await self._maybe_auto_publish_ready_plan(
-                    started=started,
-                    router_event=router_event,
-                )
-            if current_task.lifecycle_state == "WAITING_FOR_SLOT" and clarification is not None:
-                return await self._request_schema_clarification(
-                    task=current_task,
-                    caused_by_event_id=str(current_task.last_slowtask_event_id),
-                    evidence_refs=(evidence_ref,),
-                    clarification=clarification,
-                    intent=text,
-                )
-            return {
-                "status": "patch_recorded",
-                "assistant_summary": "用户补充已记录到当前计划；它没有替换既有约束，因此未改变 plan_version。",
-            }
-        clarification = self._clarification_plan(task_id=task.task_id)
-        selected_ask_fields = clarification.ask_fields if clarification is not None else ()
-        provider_result = await self._call_codex(
-            intent=text,
-            slowtask_event=restarted,
-            source_evidence_refs=(evidence_ref,),
-            state_missing_fields_hint=selected_ask_fields,
-        )
-        self._codex_proposals.append(provider_result.proposal)
-        codex_ref = self._next_ref("evidence", "codex")
-        self._record_evidence(
-            codex_ref,
-            task_id=task.task_id,
-            plan_version=int(restarted["plan_version"]),
-            label="Codex patch proposal",
-            summary="Codex 只生成 UserPatch 后的 proposal candidate；不直接修改 SlowTask facts。",
-            source="codex_adapter",
-            trust_level="evidence_candidate_only",
-        )
-
-        if handle is None:
-            task_state, _, _ = self._projections()
-            current_task = task_state.tasks[task.task_id]
-            if clarification is not None:
-                return await self._request_schema_clarification(
-                    task=current_task,
-                    caused_by_event_id=str(provider_result.structured_output_event["event_id"]),
-                    evidence_refs=(evidence_ref, codex_ref),
-                    clarification=clarification,
-                    intent=text,
-                    provider_result=provider_result,
-                )
-            started = self._review_and_start_itinerary_tool(
+            if current_task.task_requirement_model_ref is None:
+                raise ValueError("goal rewrite requires an accepted model to invalidate")
+            invalidated = self._slowtask_runtime.invalidate_task_requirement_model(
                 task_id=current_task.task_id,
-                caused_by_event_id=str(provider_result.structured_output_event["event_id"]),
-                evidence_refs=(evidence_ref, codex_ref),
+                plan_version=current_task.current_plan_version,
+                task_event_seq=current_task.current_task_event_seq + 1,
+                caused_by_event_id=analysis_cause,
+                event_id=self._next_id("task_requirement_model_invalidated"),
+                created_monotonic_ms=self._clock.monotonic_ms,
+                created_wall_clock_ms=self._clock.wall_clock_ms,
+                model_ref=current_task.task_requirement_model_ref,
+                invalidation_reason="material_goal_rewrite",
             )
-            started = _with_codex_user_visible_reply(started, provider_result)
-            return await self._maybe_auto_publish_ready_plan(
-                started=started,
+            self._invalidate_requirement_evidence(current_task.task_id)
+            model, modeler = await self._run_task_modeler(
+                run=run,
+                task_id=current_task.task_id,
+                intent=text,
+                caused_by_event_id=str(invalidated["event_id"]),
+                source_evidence_refs=(evidence_ref,),
+                goal_override=text,
+            )
+            self._track_role_result(modeler, next_role="REQUIREMENT_ANALYST")
+            task_state, _, _ = self._projections()
+            current_task = task_state.tasks[task.task_id]
+            accepted = self._slowtask_runtime.accept_task_requirement_model(
+                task_id=current_task.task_id,
+                plan_version=current_task.current_plan_version,
+                task_event_seq=current_task.current_task_event_seq + 1,
+                caused_by_event_id=str(modeler.structured_output_event["event_id"]),
+                event_id=self._next_id("task_requirement_model_accepted"),
+                created_monotonic_ms=self._clock.monotonic_ms,
+                created_wall_clock_ms=self._clock.wall_clock_ms,
+                model_payload=model.to_dict(),
+                source_proposal_ref=modeler.proposal_ref,
+                accepted_context_hash=model.accepted_context_hash,
+            )
+            incoming_slot_updates, analyst = await self._run_requirement_analyst(
+                run=run,
+                task_id=current_task.task_id,
+                intent=text,
+                evidence_ref=evidence_ref,
+                caused_by_event_id=str(accepted["event_id"]),
+            )
+            self._accept_requirement_updates(evidence_ref=evidence_ref, updates=incoming_slot_updates)
+            self._record_requirement_state_acceptance(
+                task_id=current_task.task_id,
+                updates=incoming_slot_updates,
+                caused_by_event_id=str(analyst.structured_output_event["event_id"]),
+            )
+            self._track_role_result(analyst, next_role="CLARIFIER_OR_PLANNER")
+            analysis_cause = str(analyst.structured_output_event["event_id"])
+
+        if restarted is None or handle is None:
+            return await self._advance_after_requirement_analysis(
+                run=run,
+                task_id=task.task_id,
+                intent=text,
+                caused_by_event_id=analysis_cause,
+                evidence_refs=(evidence_ref,),
                 router_event=router_event,
             )
 
@@ -920,7 +974,7 @@ class WorkbenchSession:
             task_id=current_task.task_id,
             plan_version=handle.plan_version,
             label="旧 plan ToolResult",
-            summary="demo.itinerary.search 在 plan_version=1 返回；SlowTask 已把它放入 stale_evidence。",
+            summary=f"{handle.request.tool_name} 的旧计划结果已返回；SlowTask 已把它放入 stale_evidence。",
             source="tool_result",
             trust_level="stale_evidence",
             stale=True,
@@ -936,13 +990,12 @@ class WorkbenchSession:
                 "note": "只有 SlowTask 显式 adopt/rebase 后，旧结果才可复用。",
             }
         )
-        restarted_tool = self._review_and_start_itinerary_tool(
+        automatic = await self._advance_after_requirement_analysis(
+            run=run,
             task_id=current_task.task_id,
-            caused_by_event_id=str(provider_result.structured_output_event["event_id"]),
-            evidence_refs=(evidence_ref, codex_ref),
-        )
-        automatic = await self._maybe_auto_publish_ready_plan(
-            started=restarted_tool,
+            intent=text,
+            caused_by_event_id=str(stale.produced_events[-1]["event_id"]),
+            evidence_refs=(evidence_ref,),
             router_event=router_event,
         )
         return {
@@ -1091,7 +1144,7 @@ class WorkbenchSession:
             source_tool_result_event_id=pending.source_tool_result_event_id,
             adopted_from_plan_version=pending.result_plan_version,
             adoption_reason="user explicitly requested adopt stale demo result",
-            adopted_scope=("itinerary_options", "tool_result_summary"),
+            adopted_scope=("tool_requirement_evidence", "tool_result_summary"),
             adopted_by_event_id=str(task.last_slowtask_event_id),
             resolved_arguments_ref=self._next_ref("args", "adopted"),
             provenance_ref=self._next_ref("provenance", "adopted"),
@@ -1142,6 +1195,14 @@ class WorkbenchSession:
             task = self._task_for_focus(task_state, focus_state)
             if task is None:
                 raise ValueError("current SlowTask disappeared before finalization")
+        model = self._current_requirement_model(task.task_id)
+        if model is None:
+            return {"status": "planning_blocked", "assistant_summary": "没有 accepted TaskRequirementModel，不能提交最终结果。"}
+        assessment = assess_requirements(model=model, ledger=self._slot_ledger_for_task(task.task_id))
+        if not assessment.ready_for[RequirementStage.COMMITMENT.value]:
+            return {"status": "planning_blocked", "assistant_summary": "当前 requirement 仍未满足 commitment gate，不能提前提交。"}
+        if self._role_state.get("reviewer_status") != "PASS":
+            return {"status": "planning_blocked", "assistant_summary": "Reviewer 尚未 PASS，当前按 fail-closed 阻止 SemanticCommitment。"}
         finalized = self._slowtask_runtime.finalize_current_task(
             task_id=task.task_id,
             plan_version=task.current_plan_version,
@@ -1167,6 +1228,8 @@ class WorkbenchSession:
         assistant_summary = _user_facing_final_plan(
             slots=self._slot_values,
             tool_payload=completed_payload,
+            model=model,
+            plan_payload=self._role_state.get("current_plan_payload"),
         )
         self._last_completed_plan_summary = assistant_summary
         return {
@@ -1222,6 +1285,8 @@ class WorkbenchSession:
                 "assistant_summary": _user_facing_current_plan(
                     slots=self._slot_values,
                     tool_payload=payload,
+                    model=self._current_requirement_model(task.task_id),
+                    plan_payload=self._role_state.get("current_plan_payload"),
                 ),
             }
 
@@ -1257,6 +1322,8 @@ class WorkbenchSession:
             "assistant_summary": _user_facing_current_plan(
                 slots=self._slot_values,
                 tool_payload=payload,
+                model=self._current_requirement_model(current_task.task_id),
+                plan_payload=self._role_state.get("current_plan_payload"),
             ),
         }
 
@@ -1271,16 +1338,34 @@ class WorkbenchSession:
         if not isinstance(payload, Mapping):
             return
         self._current_plan_tool_payloads[(task.task_id, task.current_plan_version)] = payload
-        if payload.get("trust_level") == "UNTRUSTED_WEB_EVIDENCE":
-            self._record_evidence(
-                self._next_ref("evidence", "web_search"),
-                task_id=task.task_id,
+        model = self._current_requirement_model(task.task_id)
+        ledger = self._slot_ledger_for_task(task.task_id)
+        tool_gaps = assess_requirements(model=model, ledger=ledger).tool_gaps if model is not None else ()
+        tool_evidence_ref = self._next_ref("evidence", "tool_requirement")
+        tool_updates = tuple(
+            SlotUpdate(
+                name=requirement_id,
+                normalized_value=payload.get("result_ref", payload.get("results", "tool result available")),
+                raw_evidence="current-plan ToolResult",
+                state=SlotState.RESOLVED,
+                evidence_ref=tool_evidence_ref,
+                source="tool_result",
                 plan_version=task.current_plan_version,
-                label="网页地点检索摘要",
-                summary="当前计划使用了带来源链接的外部网页摘要；仅作为不可信证据，不作为系统指令。",
-                source="web_search",
-                trust_level="UNTRUSTED_WEB_EVIDENCE",
+                explicit_or_inferred="tool",
             )
+            for requirement_id in tool_gaps
+        )
+        self._record_evidence(
+            tool_evidence_ref,
+            task_id=task.task_id,
+            plan_version=task.current_plan_version,
+            label="当前计划只读工具证据",
+            summary="当前计划的只读工具结果已作为 TOOL requirement 证据记录；它不具有指令权限。",
+            source="web_search" if payload.get("trust_level") == "UNTRUSTED_WEB_EVIDENCE" else "demo_tool",
+            trust_level=str(payload.get("trust_level", "TRUSTED_DEMO_TOOL_RESULT")),
+            slot_updates=tool_updates,
+        )
+        self._slot_values.update(_slot_value_map(tool_updates))
         self._conversation.append(
             {
                 "id": self._next_id("conversation_tool"),
@@ -1311,11 +1396,11 @@ class WorkbenchSession:
             kind="external_place_search_started",
             status="started",
             phase="tool",
-            label="正在调用地点检索工具（OpenStreetMap / 公开网页搜索）",
+            label="正在调用只读网页检索工具",
             detail="只读取公开地图 POI 与搜索摘要；网页内容会作为不可信证据隔离，不会执行其中的指令。",
             tool_name="webSearch",
             plan_version=handle.plan_version,
-            tool_input_summary=f"地点检索：{_safe_summary(query)}",
+            tool_input_summary=f"只读检索：{_safe_summary(query)}",
         )
         evidence = await asyncio.to_thread(self._place_search_adapter.search, query=query)
         backend_result = DemoBackendResult(
@@ -1343,7 +1428,7 @@ class WorkbenchSession:
             kind="external_place_search_completed",
             status="degraded" if evidence.degraded_reason else "completed",
             phase="tool",
-            label="地点检索工具已返回",
+            label="只读网页检索工具已返回",
             detail=(
                 f"未能取得外部结果（{evidence.degraded_reason or 'unknown'}），系统会如实保留查询失败状态。"
                 if evidence.degraded_reason
@@ -1351,7 +1436,7 @@ class WorkbenchSession:
             ),
             tool_name="webSearch",
             plan_version=handle.plan_version,
-            tool_output_summary=f"返回 {len(evidence.results)} 条可引用的地点结果。",
+            tool_output_summary=f"返回 {len(evidence.results)} 条可引用的检索结果。",
         )
         return completion
 
@@ -1359,7 +1444,7 @@ class WorkbenchSession:
         if _is_context_memory_complaint(text):
             return {
                 "status": "foreground_chat",
-                "assistant_summary": "你说得对，我会沿用前面已经记录的信息，不会要求你重复补充。你可以继续加预算、人数、忌口或直接让我继续推进。",
+                "assistant_summary": "你说得对，我会沿用前面已经接受的 requirement，不会要求你重复补充。你可以继续修改约束，或直接让我继续推进。",
             }
         return {
             "status": "foreground_chat",
@@ -1377,7 +1462,7 @@ class WorkbenchSession:
             }
         return {
             "status": "no_completed_plan",
-            "assistant_summary": "当前没有已完成的规划可以展示。请先提供任务目标、地点和用餐时间，我会在信息足够时自动生成方案。",
+            "assistant_summary": "当前没有已完成的规划可以展示。请先说明任务目标和关键约束，我会按动态 requirement model 继续处理。",
         }
 
     def _handle_no_active_cancel(self) -> dict[str, str]:
@@ -1388,7 +1473,7 @@ class WorkbenchSession:
                 "status": "no_active_task_to_cancel",
                 "assistant_summary": (
                     "当前没有正在执行的规划可取消：上一份方案已经完成，因此不会再打开取消确认。"
-                    "如果你想改时间、地点、人数或预算，请直接说明修改内容，我会创建一份明确标注的修订任务。"
+                    "如果你想修改已完成方案，请直接说明要调整的 requirement，我会创建一份明确标注的修订任务。"
                 ),
             }
         if last_task is not None and last_task.lifecycle_state == "CANCELLED":
@@ -1400,75 +1485,6 @@ class WorkbenchSession:
             "status": "no_active_task_to_cancel",
             "assistant_summary": "当前没有正在执行的规划可取消，因此不会创建取消 confirmation gate。你可以先提出需要规划的事项。",
         }
-
-    async def _call_codex(
-        self,
-        *,
-        intent: str,
-        slowtask_event: Mapping[str, Any],
-        source_evidence_refs: Sequence[str],
-        state_missing_fields_hint: Sequence[str] | None = None,
-    ) -> Any:
-        context = self._context_pack().to_dict()
-        start_mono, start_wall = self._clock.reserve()
-        self._record_live_progress(
-            kind="context_pack_ready",
-            status="ready",
-            phase="codex",
-            label="SlowTask context 已准备",
-            detail="只把受边界约束的 context pack 交给 Codex adapter。",
-        )
-        self._publish_stable_snapshot_locked()
-        result = await self._codex_adapter.propose(
-            task_context_pack=context,
-            intent=intent,
-            slowtask_event=slowtask_event,
-            source_evidence_refs=source_evidence_refs,
-            state_missing_fields_hint=state_missing_fields_hint,
-            event_id_prefix=self._next_id("codex"),
-            created_monotonic_ms=start_mono,
-            created_wall_clock_ms=start_wall,
-            on_progress=self._receive_provider_progress,
-        )
-        self._append_provider_trace(result.trace_items, base_monotonic_ms=start_mono)
-        self._record_live_progress(
-            kind="structured_output_validated",
-            status="validated",
-            phase="validation",
-            label="Codex structured output 已校验",
-            detail="proposal 仍是 evidence candidate，不推进 plan_version，也不授权工具。",
-            task_id=_optional_str(slowtask_event.get("task_id")),
-            plan_version=_optional_int(slowtask_event.get("plan_version")),
-            result_present=True,
-        )
-        self._publish_stable_snapshot_locked()
-        return result
-
-    async def _receive_provider_progress(self, item: Mapping[str, Any]) -> None:
-        self._record_live_progress(
-            kind=str(item.get("kind", "provider_event")),
-            status=str(item.get("status", "observed")),
-            phase=_provider_progress_phase(item),
-            label=_provider_progress_label(item),
-            detail=_provider_progress_detail(item),
-            task_id=_optional_str(item.get("task_id")),
-            plan_version=_optional_int(item.get("plan_version")),
-            tool_name=_optional_str(item.get("tool_name")),
-            proposal_only=_optional_bool(item.get("proposal_only")),
-            result_present=_optional_bool(item.get("result_present")),
-            usage=item.get("usage") if isinstance(item.get("usage"), Mapping) else None,
-            latency_ms=_optional_int(item.get("latency_ms")),
-            provider_mode=str(item.get("provider_mode", "codex_cli_local")),
-            output_mode=str(item.get("output_mode", "real")),
-            orchestration_role=_optional_str(item.get("orchestration_role")),
-            subtask_id=_optional_str(item.get("subtask_id")),
-            subtask_goal=_optional_str(item.get("subtask_goal")),
-            public_thought=_optional_str(item.get("public_thought")),
-            tool_input_summary=_optional_str(item.get("tool_input_summary")),
-            tool_output_summary=_optional_str(item.get("tool_output_summary")),
-            next_step=_optional_str(item.get("next_step")),
-            blocked_on_user=_optional_bool(item.get("blocked_on_user")),
-        )
 
     def _begin_live_stream(self) -> None:
         self._live_provider_progress = []
@@ -1599,6 +1615,7 @@ class WorkbenchSession:
                     output_mode=str(item.get("output_mode", "degraded")),
                     task_id=_optional_str(item.get("task_id")),
                     plan_version=_optional_int(item.get("plan_version")),
+                    task_event_seq=_optional_int(item.get("task_event_seq")),
                     created_monotonic_ms=base_monotonic_ms + sequence,
                     tool_name=_optional_str(item.get("tool_name")),
                     proposal_only=_optional_bool(item.get("proposal_only")),
@@ -1614,6 +1631,15 @@ class WorkbenchSession:
                     tool_output_summary=_optional_str(item.get("tool_output_summary")),
                     next_step=_optional_str(item.get("next_step")),
                     blocked_on_user=_optional_bool(item.get("blocked_on_user")),
+                    role=_optional_str(item.get("role")),
+                    proposal_id=_optional_str(item.get("proposal_id")),
+                    context_hash=_optional_str(item.get("context_hash")),
+                    public_summary=_optional_str(item.get("public_summary")),
+                    validation_status=_optional_str(item.get("validation_status")),
+                    degraded_reason=_optional_str(item.get("degraded_reason")),
+                    next_role=_optional_str(item.get("next_step")),
+                    accepted=_optional_bool(item.get("accepted")),
+                    rejected=_optional_bool(item.get("rejected")),
                 )
             )
 
@@ -1631,6 +1657,7 @@ class WorkbenchSession:
                 ),
                 None,
             )
+        replayed_role_state = self._replayed_role_state(active_or_last)
         return TaskContextPackBuilder().build(
             slowtask_state=slowtask_state,
             task_focus_state=focus_state,
@@ -1640,7 +1667,40 @@ class WorkbenchSession:
             latest_user_input=self._last_user_input,
             resolved_argument_values=self._resolved_argument_values,
             task_created_event_id=task_created_event_id,
+            role_state=replayed_role_state,
         )
+
+    def _replayed_role_state(self, task: SlowTaskRecord | None) -> Mapping[str, Any]:
+        """Project auditable role state from the journal, with local plan payload kept private."""
+
+        if task is None:
+            return dict(self._role_state)
+        events = [
+            event
+            for event in self._journal.events()
+            if event.get("event_name") == "SLOW_LLM_STRUCTURED_OUTPUT_EMITTED"
+            and event.get("task_id") == task.task_id
+        ]
+        current_events = [
+            event for event in events if int(event.get("plan_version", 0)) == task.current_plan_version
+        ]
+        latest = current_events[-1] if current_events else None
+        planners = [event for event in current_events if event.get("role") == "PLANNER"]
+        reviewers = [event for event in current_events if event.get("role") == "REVIEWER"]
+        return {
+            "current_role": latest.get("role") if latest is not None else None,
+            "prior_role_proposal_refs": [
+                str(event["structured_output_ref"])
+                for event in events[-24:]
+                if event.get("structured_output_ref")
+            ],
+            "planner_mode": planners[-1].get("planning_mode") if planners else None,
+            "current_plan_proposal_ref": (
+                planners[-1].get("structured_output_ref") if planners else None
+            ),
+            "reviewer_status": reviewers[-1].get("reviewer_verdict") if reviewers else None,
+            "current_plan_payload": self._role_state.get("current_plan_payload"),
+        }
 
     @staticmethod
     def _task_for_context(state: SlowTaskState) -> SlowTaskRecord | None:
@@ -1715,46 +1775,375 @@ class WorkbenchSession:
                 return handle
         return None
 
-    def _customer_reception_schema(self) -> TaskSchema:
-        manifests = {manifest.tool_name: manifest.required_arguments for manifest in mvp2_demo_tool_manifests()}
-        return customer_reception_schema(tool_required_arguments=manifests)
-
     def _slot_ledger_for_task(self, task_id: str | None = None) -> SlotLedger:
-        updates = updates_from_evidence_catalog(self._evidence_catalog, task_id=task_id)
+        updates = list(updates_from_evidence_catalog(self._evidence_catalog, task_id=task_id))
+        task_state, _, _ = self._projections()
+        task = task_state.tasks.get(task_id) if task_id is not None else self._task_for_context(task_state)
+        if task is not None and task.task_requirement_model is not None:
+            model = task_requirement_model_from_dict(
+                task.task_requirement_model, tool_registry=self._tool_registry
+            )
+            tool_requirement_ids = {
+                spec.requirement_id
+                for spec in model.requirements
+                if spec.source_route == RequirementSourceRoute.TOOL
+            }
+            updates = [
+                update
+                for update in updates
+                if update.name not in tool_requirement_ids
+                or update.plan_version == task.current_plan_version
+            ]
+        known_names = {update.name for update in updates}
+        if task is not None:
+            for requirement_id, status in task.requirement_states.items():
+                if requirement_id in known_names or status in {"UNKNOWN", "NOT_APPLICABLE"}:
+                    continue
+                refs = task.requirement_state_evidence_refs.get(requirement_id, ())
+                updates.append(
+                    SlotUpdate(
+                        name=requirement_id,
+                        normalized_value=None,
+                        raw_evidence="recorded requirement state",
+                        state=SlotState(status),
+                        evidence_ref=refs[0] if refs else "evidence://journal/requirement-state",
+                        source="event_journal_replay",
+                        plan_version=task.current_plan_version,
+                    )
+                )
         return build_slot_ledger(
             updates,
-            asked_counts=asked_count_map_from_events(self._journal.events()),
+            asked_counts=self._clarification_asked_counts(),
         )
 
+    def _current_requirement_model(self, task_id: str | None = None) -> TaskRequirementModel | None:
+        task_state, _, _ = self._projections()
+        task = task_state.tasks.get(task_id) if task_id is not None else self._task_for_context(task_state)
+        if task is None or task.task_requirement_model is None:
+            return None
+        return task_requirement_model_from_dict(task.task_requirement_model, tool_registry=self._tool_registry)
+
     def _requirement_assessment(self, task_id: str | None = None) -> RequirementAssessment:
-        return evaluate_requirements(
-            schema=self._task_schema,
-            ledger=self._slot_ledger_for_task(task_id),
-            task_features=self._task_features,
-        )
+        model = self._current_requirement_model(task_id)
+        if model is None:
+            raise ValueError("SlowTask has no accepted TaskRequirementModel")
+        return assess_requirements(model=model, ledger=self._slot_ledger_for_task(task_id))
 
     def _clarification_plan(
         self,
         *,
         task_id: str | None = None,
         clarification_id: str | None = None,
-    ) -> ClarificationPlan | None:
+    ) -> _DynamicClarificationPlan | None:
+        model = self._current_requirement_model(task_id)
+        if model is None:
+            return None
         ledger = self._slot_ledger_for_task(task_id)
-        assessment = evaluate_requirements(
-            schema=self._task_schema,
-            ledger=ledger,
-            task_features=self._task_features,
+        assessment = assess_requirements(model=model, ledger=ledger)
+        selected = select_user_blockers(model=model, ledger=ledger)
+        if not selected:
+            return None
+        blocked_stage = next(
+            (stage.value for stage in RequirementStage if set(selected) & set(assessment.missing_by_stage[stage.value])),
+            RequirementStage.PLAN.value,
         )
-        return plan_clarification(
-            schema=self._task_schema,
-            ledger=ledger,
-            assessment=assessment,
+        counts = self._clarification_asked_counts()
+        reason = "conflicting" if set(selected) & set(assessment.conflicting) else "ambiguous" if set(selected) & set(assessment.ambiguous) else "missing"
+        return _DynamicClarificationPlan(
             clarification_id=clarification_id or self._next_id("clarification"),
+            blocked_stage=blocked_stage,
+            ask_fields=selected,
+            known_fields=ledger.resolved_fields(),
+            reason=reason,
+            attempt=1 + max((counts.get(item, 0) for item in selected), default=0),
         )
 
-    def _merge_slot_values(self, text: str) -> None:
-        self._slot_values.update(_slot_value_map(_extract_workbench_slot_updates(text)))
-        self._task_features.update(_extract_workbench_task_features(text))
+    def _clarification_asked_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for event in self._journal.events():
+            if event.get("event_name") != "CLARIFICATION_REQUESTED":
+                continue
+            for requirement_id in event.get("missing_or_ambiguous_fields", ()):
+                name = str(requirement_id)
+                counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    def _role_invocation(
+        self,
+        *,
+        task_id: str,
+        caused_by_event_id: str,
+        source_evidence_refs: Sequence[str],
+        role_context: Mapping[str, Any],
+        prefix: str,
+    ) -> dict[str, Any]:
+        task_state, _, _ = self._projections()
+        task = task_state.tasks[task_id]
+        context_pack = self._context_pack().to_dict()
+        mono, wall = self._clock.reserve()
+        return {
+            "task_context_pack": context_pack,
+            "role_context": dict(role_context),
+            "task_binding": {
+                "task_id": task.task_id,
+                "plan_version": task.current_plan_version,
+                "task_event_seq": task.current_task_event_seq,
+            },
+            "source_evidence_refs": tuple(source_evidence_refs),
+            "event_id_prefix": self._next_id(prefix),
+            "caused_by_event_id": caused_by_event_id,
+            "created_monotonic_ms": mono,
+            "created_wall_clock_ms": wall,
+            "context_hash": context_pack["context_hash"],
+        }
+
+    async def _run_task_modeler(
+        self,
+        *,
+        run: RoleRun,
+        task_id: str,
+        intent: str,
+        caused_by_event_id: str,
+        source_evidence_refs: Sequence[str],
+        goal_override: str | None = None,
+    ) -> tuple[TaskRequirementModel, RoleInvocationResult]:
+        context = self._context_pack().to_dict()
+        invocation = self._role_invocation(
+            task_id=task_id,
+            caused_by_event_id=caused_by_event_id,
+            source_evidence_refs=source_evidence_refs,
+            role_context={
+                "goal": goal_override or context.get("current_goal", intent),
+                "latest_user_input": intent,
+                "accepted_evidence_summary": context.get("accepted_evidence_summaries", ()),
+                "known_facts": [
+                    item
+                    for item in context.get("requirement_summary", ())
+                    if item.get("status") == "RESOLVED"
+                ],
+                "available_tool_manifest_summaries": context.get("available_tool_manifest_summaries", ()),
+                "system_constraints": ["proposal_only", "demo_sandbox_only", "no_secrets"],
+            },
+            prefix="task_modeler",
+        )
+        return await self._role_orchestrator.model_task(run=run, invocation=invocation)
+
+    async def _run_requirement_analyst(
+        self,
+        *,
+        run: RoleRun,
+        task_id: str,
+        intent: str,
+        evidence_ref: str,
+        caused_by_event_id: str,
+    ) -> tuple[tuple[SlotUpdate, ...], RoleInvocationResult]:
+        model = self._current_requirement_model(task_id)
+        if model is None:
+            raise ValueError("Requirement Analyst requires an accepted TaskRequirementModel")
+        ledger = self._slot_ledger_for_task(task_id)
+        task_state, _, _ = self._projections()
+        task = task_state.tasks[task_id]
+        invocation = self._role_invocation(
+            task_id=task_id,
+            caused_by_event_id=caused_by_event_id,
+            source_evidence_refs=(evidence_ref,),
+            role_context={
+                "task_requirement_model": model.to_dict(),
+                "requirement_summary": list(ledger.summary({item.requirement_id: item.label for item in model.requirements})),
+                "evidence_text": intent,
+                "source_evidence_refs": [evidence_ref],
+                "stale_evidence_refs": list(task.stale_evidence_refs),
+            },
+            prefix="requirement_analyst",
+        )
+        return await self._role_orchestrator.analyze_requirements(
+            run=run,
+            model=model,
+            ledger=ledger,
+            stale_evidence_refs=task.stale_evidence_refs,
+            invocation=invocation,
+        )
+
+    def _accept_requirement_updates(self, *, evidence_ref: str, updates: Sequence[SlotUpdate]) -> None:
+        if evidence_ref not in self._evidence_catalog:
+            raise ValueError("accepted requirement updates require recorded evidence")
+        self._evidence_catalog[evidence_ref]["slot_updates"] = [update.to_metadata() for update in updates]
+        self._slot_values.update(_slot_value_map(updates))
+
+    def _record_requirement_state_acceptance(
+        self,
+        *,
+        task_id: str,
+        updates: Sequence[SlotUpdate],
+        caused_by_event_id: str,
+    ) -> Mapping[str, Any] | None:
+        if not updates:
+            return None
+        task_state, _, _ = self._projections()
+        task = task_state.tasks[task_id]
+        evidence_refs = tuple(dict.fromkeys(update.evidence_ref for update in updates))
+        return self._slowtask_runtime.accept_requirement_states(
+            task_id=task.task_id,
+            plan_version=task.current_plan_version,
+            task_event_seq=task.current_task_event_seq + 1,
+            caused_by_event_id=caused_by_event_id,
+            event_id=self._next_id("requirement_states_accepted"),
+            created_monotonic_ms=self._clock.monotonic_ms,
+            created_wall_clock_ms=self._clock.wall_clock_ms,
+            evidence_refs=evidence_refs,
+            accepted_requirement_states=[
+                {
+                    "requirement_id": update.name,
+                    "status": update.state.value,
+                    "source_evidence_refs": [update.evidence_ref],
+                }
+                for update in updates
+            ],
+        )
+
+    def _invalidate_requirement_evidence(self, task_id: str) -> None:
+        for item in self._evidence_catalog.values():
+            if str(item.get("task_id", "")) == task_id:
+                item["slot_updates"] = []
+        self._slot_values.clear()
+
+    def _track_role_result(self, result: RoleInvocationResult, *, next_role: str | None) -> None:
+        self._role_state["current_role"] = result.role.value
+        refs = list(self._role_state.get("prior_role_proposal_refs", ()))
+        refs.append(result.proposal_ref)
+        self._role_state["prior_role_proposal_refs"] = refs[-24:]
+        trace = dict(result.trace_item)
+        trace["provider_mode"] = self._config.provider_mode
+        trace["output_mode"] = str(result.structured_output_event.get("output_mode", "degraded"))
+        trace["result_present"] = True
+        trace["next_step"] = next_role
+        trace["task_event_seq"] = result.proposal["task_binding"].get("task_event_seq")
+        trace["accepted"] = True
+        trace["rejected"] = result.validation_failed_event is not None
+        self._append_provider_trace((trace,), base_monotonic_ms=self._clock.monotonic_ms)
+        self._record_live_progress(
+            kind="role_invocation",
+            status=result.validation_status,
+            phase="codex_role",
+            label=f"{result.role.value} 结构化 proposal 已校验",
+            detail=str(result.proposal["public_summary"]),
+            task_id=_optional_str(result.proposal["task_binding"].get("task_id")),
+            plan_version=_optional_int(result.proposal["task_binding"].get("plan_version")),
+            proposal_only=True,
+            result_present=True,
+            orchestration_role=result.role.value,
+            next_step=next_role,
+            blocked_on_user=result.role.value == "CLARIFIER",
+        )
+
+    async def _advance_after_requirement_analysis(
+        self,
+        *,
+        run: RoleRun,
+        task_id: str,
+        intent: str,
+        caused_by_event_id: str,
+        evidence_refs: Sequence[str],
+        router_event: Mapping[str, Any],
+    ) -> dict[str, str]:
+        task_state, _, _ = self._projections()
+        task = task_state.tasks[task_id]
+        model = self._current_requirement_model(task_id)
+        if model is None:
+            return {"status": "planning_blocked", "assistant_summary": "任务需求模型尚未通过校验，当前不会规划或启动工具。"}
+        ledger = self._slot_ledger_for_task(task_id)
+        assessment = assess_requirements(model=model, ledger=ledger)
+        clarification = self._clarification_plan(task_id=task_id)
+        if clarification is not None:
+            return await self._request_schema_clarification(
+                task=task,
+                caused_by_event_id=caused_by_event_id,
+                evidence_refs=evidence_refs,
+                clarification=clarification,
+                intent=intent,
+                run=run,
+            )
+        if assessment.derived_or_system_gaps:
+            return {
+                "status": "planning_blocked",
+                "assistant_summary": "仍有只能由系统或受验证推导提供的条件，当前按 fail-closed 保持规划状态。",
+            }
+        if task.lifecycle_state == "WAITING_FOR_SLOT":
+            resumed = self._slowtask_runtime.run_planning_started(
+                task_id=task.task_id,
+                plan_version=task.current_plan_version,
+                caused_by_event_id=str(task.last_slowtask_event_id),
+                event_id_prefix=self._next_id("requirement_resolution_planning"),
+                created_monotonic_ms=self._clock.monotonic_ms,
+                created_wall_clock_ms=self._clock.wall_clock_ms,
+                start_task_event_seq=task.current_task_event_seq + 1,
+                from_state="WAITING_FOR_SLOT",
+                planning_reason="selected_user_requirements_resolved_without_plan_replacement",
+            )
+            caused_by_event_id = str(resumed.produced_events[-1]["event_id"])
+            task_state, _, _ = self._projections()
+            task = task_state.tasks[task_id]
+        context = self._context_pack().to_dict()
+        role_context = {
+            "task_requirement_model": model.to_dict(),
+            "task_summary": model.task_summary,
+            "resolved_requirement_ids": list(ledger.resolved_fields()),
+            "accepted_facts": ledger.value_map(),
+            "tool_gap_ids": list(assessment.tool_gaps),
+            "current_plan_evidence": list(evidence_refs),
+            "stale_evidence_refs": list(task.stale_evidence_refs),
+            "available_tool_manifest_summaries": context.get("available_tool_manifest_summaries", ()),
+            "success_criteria": list(model.success_criteria),
+            "planner_mode": "INFORMATION_GATHERING" if assessment.tool_gaps else "FINAL_PLAN_CANDIDATE",
+        }
+        invocation = self._role_invocation(
+            task_id=task_id,
+            caused_by_event_id=caused_by_event_id,
+            source_evidence_refs=evidence_refs,
+            role_context=role_context,
+            prefix="planner_reviewer",
+        )
+        reviewed = await self._role_orchestrator.plan_and_review(run=run, invocation=invocation)
+        self._track_role_result(reviewed.planner, next_role="REVIEWER")
+        self._track_role_result(reviewed.reviewer, next_role=None if reviewed.accepted else "BLOCKED")
+        self._role_state["planner_mode"] = reviewed.planner.proposal["payload"].get("planning_mode")
+        self._role_state["current_plan_proposal_ref"] = reviewed.planner.proposal_ref
+        self._role_state["current_plan_payload"] = dict(reviewed.planner.proposal["payload"])
+        self._role_state["reviewer_status"] = reviewed.reviewer.proposal["payload"].get("verdict", "BLOCK")
+        self._codex_proposals.append(_legacy_role_proposal(reviewed.planner, model=model))
+        if not reviewed.accepted:
+            return _user_visible_role_result(
+                status="planning_blocked",
+                assistant_summary=_reviewer_block_user_summary(
+                    reviewed.reviewer.proposal["payload"]
+                ),
+                role_result=reviewed.reviewer,
+            )
+        tool_calls = reviewed.planner.proposal["payload"].get("proposed_tool_calls", ())
+        if assessment.tool_gaps and not tool_calls:
+            return _user_visible_role_result(
+                status="planning_blocked",
+                assistant_summary="Planner 没有为 TOOL 类型缺口提出可校验的工具调用，当前不会继续。",
+                role_result=reviewed.planner,
+            )
+        if tool_calls:
+            started = self._review_and_start_planner_tool(
+                task_id=task_id,
+                caused_by_event_id=str(reviewed.reviewer.structured_output_event["event_id"]),
+                evidence_refs=evidence_refs,
+                tool_call=tool_calls[0],
+            )
+            published = await self._maybe_auto_publish_ready_plan(started=started, router_event=router_event)
+            return _user_visible_role_result(
+                status=str(published["status"]),
+                assistant_summary=str(published["assistant_summary"]),
+                role_result=reviewed.planner,
+            )
+        return _user_visible_role_result(
+            status="plan_ready",
+            assistant_summary=str(reviewed.planner.proposal["payload"]["plan_summary"]),
+            role_result=reviewed.planner,
+        )
 
     async def _request_schema_clarification(
         self,
@@ -1762,9 +2151,9 @@ class WorkbenchSession:
         task: SlowTaskRecord,
         caused_by_event_id: str,
         evidence_refs: Sequence[str],
-        clarification: ClarificationPlan,
+        clarification: _DynamicClarificationPlan,
         intent: str,
-        provider_result: Any | None = None,
+        run: RoleRun | None = None,
     ) -> dict[str, str]:
         review_cause = caused_by_event_id
         task_state, _, _ = self._projections()
@@ -1790,8 +2179,11 @@ class WorkbenchSession:
         ambiguous_or_conflicting = (
             selected_fields
             if clarification.reason in {"ambiguous", "conflicting"}
-            else tuple((*assessment.ambiguous_fields, *assessment.conflicting_fields))
+            else tuple((*assessment.ambiguous, *assessment.conflicting))
         )
+        model = self._current_requirement_model(task.task_id)
+        if model is None:
+            return {"status": "planning_blocked", "assistant_summary": "任务需求模型不存在，当前无法生成追问。"}
         review = self._slowtask_runtime.review_evidence(
             task_id=current_task.task_id,
             plan_version=current_task.current_plan_version,
@@ -1801,53 +2193,73 @@ class WorkbenchSession:
             created_wall_clock_ms=self._clock.wall_clock_ms,
             start_task_event_seq=current_task.current_task_event_seq + 1,
             evidence_refs=evidence_refs,
-            required_fields=tuple(self._task_schema.slots_by_name),
+            required_fields=tuple(item.requirement_id for item in model.requirements),
             resolved_fields=self._slot_ledger_for_task(current_task.task_id).resolved_fields(),
             ambiguous_fields=ambiguous_or_conflicting,
             missing_fields=selected_fields if clarification.reason == "missing" else (),
             clarification_prompt_ref=self._next_ref("prompt", "missing_slots"),
             resolution_reason=f"schema_requirement_{clarification.reason}",
         )
-        if provider_result is None:
-            evidence_reviewed_event = next(
-                event for event in review.produced_events if event["event_name"] == "EVIDENCE_REVIEWED"
-            )
-            provider_result = await self._call_codex(
-                intent=intent,
-                slowtask_event=evidence_reviewed_event,
-                source_evidence_refs=evidence_refs,
-                state_missing_fields_hint=selected_fields,
-            )
-            self._codex_proposals.append(provider_result.proposal)
-            task_state, _, _ = self._projections()
-            current_task = task_state.tasks[task.task_id]
-            codex_ref = self._next_ref("evidence", "codex")
-            self._record_evidence(
-                codex_ref,
-                task_id=current_task.task_id,
-                plan_version=current_task.current_plan_version,
-                label="Codex clarification proposal",
-                summary="Codex 只生成了追问建议；SlowTask 保持 WAITING_FOR_SLOT，不启动工具。",
-                source="codex_adapter",
-                trust_level="evidence_candidate_only",
-            )
-        return {
-            "status": "waiting_for_slot",
-            "assistant_summary": _codex_user_visible_reply(provider_result),
+        evidence_reviewed_event = next(
+            event for event in review.produced_events if event["event_name"] == "EVIDENCE_REVIEWED"
+        )
+        specs = model.requirements_by_id
+        role_context = {
+            "selected_requirement_ids": list(selected_fields),
+            "selected_labels": {item: specs[item].label for item in selected_fields},
+            "selected_descriptions": {item: specs[item].description for item in selected_fields},
+            "reason": clarification.reason,
+            "asked_counts": self._clarification_asked_counts(),
+            "recent_user_input": intent,
+            "max_questions": 1,
+            "max_fields": 3,
         }
+        invocation = self._role_invocation(
+            task_id=current_task.task_id,
+            caused_by_event_id=str(evidence_reviewed_event["event_id"]),
+            source_evidence_refs=evidence_refs,
+            role_context=role_context,
+            prefix="clarifier",
+        )
+        run = run or self._role_orchestrator.patch_run()
+        clarified = await self._role_orchestrator.clarify(
+            run=run,
+            model=model,
+            selected_requirement_ids=selected_fields,
+            invocation=invocation,
+        )
+        self._track_role_result(clarified, next_role="WAIT_FOR_USER")
+        self._codex_proposals.append(_legacy_role_proposal(clarified, model=model))
+        task_state, _, _ = self._projections()
+        current_task = task_state.tasks[task.task_id]
+        codex_ref = self._next_ref("evidence", "codex_role")
+        self._record_evidence(
+            codex_ref,
+            task_id=current_task.task_id,
+            plan_version=current_task.current_plan_version,
+            label="Clarifier proposal",
+            summary="Clarifier 只表述 SlowTask 已选定的 requirement，不拥有缺口判断。",
+            source="codex_role_adapter",
+            trust_level="evidence_candidate_only",
+        )
+        return _user_visible_role_result(
+            status="waiting_for_slot",
+            assistant_summary=str(clarified.proposal["payload"]["question_text"]),
+            role_result=clarified,
+        )
 
-    def _review_and_start_itinerary_tool(
+    def _review_and_start_planner_tool(
         self,
         *,
         task_id: str,
         caused_by_event_id: str,
         evidence_refs: Sequence[str],
+        tool_call: Mapping[str, Any],
     ) -> dict[str, str]:
         task_state, _, _ = self._projections()
         task = task_state.tasks[task_id]
         clarification = self._clarification_plan(task_id=task_id)
         if clarification is not None:
-            assessment = self._requirement_assessment(task_id)
             self._slowtask_runtime.review_evidence(
                 task_id=task_id,
                 plan_version=task.current_plan_version,
@@ -1857,23 +2269,30 @@ class WorkbenchSession:
                 created_wall_clock_ms=self._clock.wall_clock_ms,
                 start_task_event_seq=task.current_task_event_seq + 1,
                 evidence_refs=evidence_refs,
-                required_fields=tuple(self._task_schema.slots_by_name),
+                required_fields=clarification.ask_fields,
                 resolved_fields=self._slot_ledger_for_task(task_id).resolved_fields(),
-                ambiguous_fields=tuple((*assessment.ambiguous_fields, *assessment.conflicting_fields)),
+                ambiguous_fields=clarification.ask_fields if clarification.reason != "missing" else (),
                 missing_fields=clarification.ask_fields if clarification.reason == "missing" else (),
                 clarification_prompt_ref=self._next_ref("prompt", "missing_slots"),
                 resolution_reason=f"pre_tool_schema_requirement_{clarification.reason}",
             )
             return {
                 "status": "waiting_for_slot",
-                "assistant_summary": "我还不能开始查询，因为当前接待规划仍缺少或含糊的信息；请先补充追问中的字段。",
+                "assistant_summary": "我还不能启动工具，因为当前任务仍有需要用户解决的条件。",
             }
 
+        model = self._current_requirement_model(task_id)
+        if model is None:
+            return {"status": "tool_blocked", "assistant_summary": "没有 accepted TaskRequirementModel，工具调用已阻止。"}
+        ledger = self._slot_ledger_for_task(task_id)
         required_fields = tuple(
-            field
-            for field in ("time_window", "location_anchor", "party_size")
-            if field in self._task_schema.slots_by_name
+            spec.requirement_id
+            for spec in model.requirements
+            if spec.required_at is not None
+            and spec.source_route != RequirementSourceRoute.TOOL
+            and spec.requirement_id in ledger.resolved_fields()
         )
+        resolved_fields = required_fields
         review = self._slowtask_runtime.review_evidence(
             task_id=task_id,
             plan_version=task.current_plan_version,
@@ -1884,12 +2303,14 @@ class WorkbenchSession:
             start_task_event_seq=task.current_task_event_seq + 1,
             evidence_refs=evidence_refs,
             required_fields=required_fields,
-            resolved_fields=required_fields,
+            resolved_fields=resolved_fields,
             resolved_arguments_ref=self._next_ref("args", "resolved"),
             provenance_ref=self._next_ref("provenance", "arguments"),
             field_provenance_refs=evidence_refs,
         )
-        self._resolved_argument_values = _resolved_tool_arguments(self._slot_values)
+        tool_name = str(tool_call.get("tool_name", ""))
+        arguments = dict(tool_call.get("arguments", {}))
+        self._resolved_argument_values = dict(arguments)
         task_state, _, _ = self._projections()
         task = task_state.tasks[task_id]
         arguments_event = next(
@@ -1898,26 +2319,7 @@ class WorkbenchSession:
         provenance_event = next(
             event for event in review.produced_events if event["event_name"] == "ARGUMENT_RESOLUTION_PROVENANCE"
         )
-        use_external_place_search = (
-            self._config.provider_mode == "codex_cli_local"
-            or bool(self._task_features.get("meal_planning"))
-            or "agenda_duration" not in self._slot_values
-        )
-        tool_name = "webSearch" if use_external_place_search else "demo.itinerary.search"
-        arguments = (
-            {"query": _place_search_query(self._slot_values)}
-            if use_external_place_search
-            else dict(self._resolved_argument_values)
-        )
-        argument_provenance = (
-            {"query": str(provenance_event["event_id"])}
-            if use_external_place_search
-            else {
-                "company_location": str(provenance_event["event_id"]),
-                "days": str(provenance_event["event_id"]),
-                "time_window": str(provenance_event["event_id"]),
-            }
-        )
+        argument_provenance = {name: str(provenance_event["event_id"]) for name in arguments}
         request = ToolExecutionRequest(
             tool_call_id=self._next_id("tool_call"),
             tool_name=tool_name,
@@ -1926,7 +2328,7 @@ class WorkbenchSession:
             current_plan_version=task.current_plan_version,
             start_task_event_seq=task.current_task_event_seq + 1,
             caused_by_event_id=str(review.produced_events[-1]["event_id"]),
-            event_id_prefix=self._next_id("itinerary_search"),
+            event_id_prefix=self._next_id("planner_tool"),
             created_monotonic_ms=self._clock.monotonic_ms,
             created_wall_clock_ms=self._clock.wall_clock_ms,
             idempotency_key=self._next_id("idempotency"),
@@ -1934,7 +2336,7 @@ class WorkbenchSession:
             argument_provenance=argument_provenance,
             resolved_arguments_ref=str(arguments_event["event_id"]),
             provenance_ref=str(provenance_event["event_id"]),
-            preview_ref=self._next_ref("preview", "itinerary"),
+            preview_ref=self._next_ref("preview", "planner_tool"),
         )
         started = self._tool_executor.begin(request)
         if started.handle is None:
@@ -1958,11 +2360,7 @@ class WorkbenchSession:
         self._in_flight_handles[request.tool_call_id] = handle
         return {
             "status": "tool_running",
-            "assistant_summary": (
-                "信息已经足够，我正在调用只读网页/地图地点检索，并会在当前计划的结果返回后自动给出方案。"
-                if use_external_place_search
-                else "信息够了，我先按你补充的时间和地点范围去查一个沙盒里的候选方案。你也可以继续补充预算、人数或偏好。"
-            ),
+            "assistant_summary": f"Planner 提出了经过校验的只读工具候选 {tool_name}；Tool Executor 已按当前 plan 授权并启动。",
         }
 
     def _latest_text_input_event(self, *, turn_id: str) -> Mapping[str, Any]:
@@ -2184,96 +2582,64 @@ def _frame_hints(action: str) -> tuple[str, bool, str]:
     return "FOREGROUND_CHAT", False, "simple"
 
 
-def _extract_workbench_slot_updates(
-    text: str,
-    *,
-    evidence_ref: str = "",
-    plan_version: int = 1,
-    source: str = "user_text",
-) -> tuple[SlotUpdate, ...]:
-    lowered = text.lower()
-    updates: list[SlotUpdate] = []
-    compact = re.sub(r"\s+", "", text)
-
-    def add(
-        name: str,
-        value: Any,
-        *,
-        state: SlotState = SlotState.RESOLVED,
-        explicit_or_inferred: str = "explicit",
-    ) -> None:
-        updates.append(
-            SlotUpdate(
-                name=name,
-                normalized_value=value,
-                raw_evidence=_safe_summary(text),
-                state=state,
-                evidence_ref=evidence_ref,
-                source=source,
-                plan_version=plan_version,
-                explicit_or_inferred=explicit_or_inferred,
-            )
-        )
-
-    location_match = re.search(
-        r"((?:北京市)?(?:海淀区)?[^，。；;]{0,32}(?:中关村|领展|欧美汇|丹棱街)[^，。；;]{0,32}(?:附近|广场|购物中心|购物广场)?)",
-        text,
-    )
-    if location_match:
-        add("location_anchor", _safe_summary(location_match.group(1)))
-    elif any(marker in text for marker in ("公司", "办公室", "园区", "酒店", "机场", "车站", "餐厅", "会议室", "地点", "附近", "位置", "中关村", "领展", "北京")) or any(
-        marker in lowered for marker in ("office", "hotel", "airport", "station", "near")
-    ):
-        add("location_anchor", _safe_summary(text))
-    explicit_time = re.search(r"(\d{1,2})\s*[点:：]\s*(半|\d{1,2})?", compact)
-    if explicit_time:
-        hour = int(explicit_time.group(1))
-        minute = "30" if explicit_time.group(2) == "半" else (explicit_time.group(2) or "00")
-        add("time_window", f"{hour:02d}:{minute}")
-    elif any(marker in text for marker in ("下周吧", "下周左右", "下周都行")):
-        add("time_window", "下周（缺少具体日期和时段）", state=SlotState.AMBIGUOUS)
-    elif any(marker in text for marker in ("今天", "明天", "后天", "上午", "下午", "晚上", "中午", "午饭", "午餐", "晚饭", "晚餐", "周一", "周二", "周三", "周四", "周五", "周六", "周日")) or any(
-        marker in lowered for marker in ("today", "tomorrow", "morning", "afternoon", "evening", "lunch", "dinner")
-    ) or re.search(r"\d{1,2}月\d{1,2}[号日]?", compact):
-        add("time_window", "晚餐时段（建议 18:30）" if any(marker in text for marker in ("晚上", "晚饭", "晚餐")) else _safe_summary(text))
-    if any(marker in text for marker in ("两天", "2天", "二天", "两日", "2日")) or any(marker in lowered for marker in ("two days", "2 days")):
-        add("agenda_duration", "2")
-    party_match = re.search(r"(\d+|[一二三四五六七八九十两]+)\s*个?人", text)
-    if party_match:
-        add("party_size", f"{party_match.group(1)} 人")
-    budget_match = re.search(r"(人均\s*)?\d+\s*(元|块|以内|以下)", text)
-    if budget_match:
-        budget_digits = re.search(r"\d+", budget_match.group(0))
-        add("budget", f"人均 {budget_digits.group(0)} 元以内" if budget_digits else budget_match.group(0))
-    if any(marker in text for marker in ("无忌口", "没有忌口", "没忌口", "没有饮食限制")):
-        add("dietary_constraints", [])
-    elif any(marker in text for marker in ("不吃辣", "忌口", "过敏", "清淡", "素食", "没有其他忌口")):
-        non_spicy_count = re.search(r"(\d+|[一二三四五六七八九十两]+)\s*(?:位|个)?[^，。；;]{0,8}不吃辣", text)
-        add(
-            "dietary_constraints",
-            f"{non_spicy_count.group(1)}位客人不吃辣"
-            if non_spicy_count
-            else "有客人不吃辣，菜品需可分开调味",
-        )
-    if "云南菜" in text or "滇菜" in text:
-        add("cuisine_preference", "云南菜")
-    elif any(marker in text for marker in ("随便", "都可以", "都行")):
-        add("cuisine_preference", "都可以")
-    if any(marker in text for marker in ("晚上", "晚饭", "晚餐")):
-        add("meal_type", "晚餐")
-    elif any(marker in text for marker in ("中午", "午饭", "午餐")):
-        add("meal_type", "午餐")
-    if any(marker in text for marker in ("包间", "安静", "商务环境")):
-        add("private_room", _safe_summary(text))
-    if any(marker in text for marker in ("发票", "报销")):
-        add("invoice_needed", True)
-    if "停车" in text:
-        add("parking_needed", True)
-    if any(marker in text for marker in ("接送", "用车", "打车", "交通")):
-        add("transport_needed", True)
-    if any(marker in text for marker in ("重要客户", "外地客户", "海外客户", "领导", "高管")):
-        add("guest_profile", _safe_summary(text))
-    return tuple(updates)
+def _legacy_role_proposal(
+    result: RoleInvocationResult, *, model: TaskRequirementModel
+) -> dict[str, Any]:
+    payload = result.proposal["payload"]
+    safety = {
+        "codex_is_fact_owner": False,
+        "advances_plan_version": False,
+        "authorizes_tool": False,
+        "contains_secret": False,
+        "mutates_task_snapshot": False,
+        "emits_canonical_event": False,
+        "executes_external_tool": False,
+        "contains_raw_provider_body": False,
+    }
+    if result.role.value == "CLARIFIER":
+        covered = list(payload.get("covered_requirement_ids", ()))
+        return {
+            "proposal_id": result.proposal["proposal_id"],
+            "proposal_type": "clarification",
+            "status": result.validation_status,
+            "summary": result.proposal["public_summary"],
+            "question_text": payload.get("question_text", ""),
+            "covered_fields": covered,
+            "backend_selected_ask_fields": covered,
+            "diagnostic_model_missing_fields": covered,
+            "known_fields": [],
+            "missing_fields": covered,
+            "proposal_only": True,
+            "role": result.role.value,
+            "context_hash": result.proposal["input_context_hash"],
+            "degraded_reason": result.degraded_reason,
+            "suggested_next_steps": ["等待用户补充后交回 Requirement Analyst。"],
+            "requires_confirmation": False,
+            "risk_notes": [],
+            "source_evidence_refs": list(result.proposal.get("source_evidence_refs", ())),
+            "safety": safety,
+        }
+    return {
+        "proposal_id": result.proposal["proposal_id"],
+        "proposal_type": "plan",
+        "status": result.validation_status,
+        "summary": payload.get("plan_summary", result.proposal["public_summary"]),
+        "covered_fields": list(payload.get("requirement_coverage", ())),
+        "known_fields": list(payload.get("requirement_coverage", ())),
+        "missing_fields": [],
+        "proposal_only": True,
+        "role": result.role.value,
+        "task_kind": model.task_kind,
+        "planning_mode": payload.get("planning_mode"),
+        "proposed_tool_calls": list(payload.get("proposed_tool_calls", ())),
+        "context_hash": result.proposal["input_context_hash"],
+        "degraded_reason": result.degraded_reason,
+        "suggested_next_steps": list(payload.get("ordered_steps", ())),
+        "requires_confirmation": bool(payload.get("requires_confirmation", False)),
+        "risk_notes": list(payload.get("risks", ())),
+        "source_evidence_refs": list(result.proposal.get("source_evidence_refs", ())),
+        "safety": safety,
+    }
 
 
 def _slot_value_map(updates: Sequence[SlotUpdate]) -> dict[str, Any]:
@@ -2286,151 +2652,52 @@ def _slot_value_map(updates: Sequence[SlotUpdate]) -> dict[str, Any]:
     return values
 
 
-def _extract_workbench_task_features(text: str) -> dict[str, Any]:
-    meal_planning = any(
-        marker in text
-        for marker in (
-            "午饭",
-            "午餐",
-            "晚饭",
-            "晚餐",
-            "用餐",
-            "餐厅",
-            "吃饭",
-            "菜",
-            "忌口",
-            "包间",
-        )
-    )
-    return {"meal_planning": True} if meal_planning else {}
-
-
-def _resolved_tool_arguments(slots: Mapping[str, Any]) -> dict[str, Any]:
-    arguments: dict[str, Any] = {}
-    if slots.get("location_anchor"):
-        arguments["company_location"] = str(slots["location_anchor"])
-    if slots.get("agenda_duration") and str(slots["agenda_duration"]).isdigit():
-        arguments["days"] = int(str(slots["agenda_duration"]))
-    if slots.get("time_window"):
-        arguments["time_window"] = str(slots["time_window"])
-    if slots.get("budget"):
-        budget_digits = re.search(r"\d+", str(slots["budget"]))
-        if budget_digits:
-            arguments["budget_max"] = int(budget_digits.group(0))
-    return arguments
-
-
-def _place_search_query(slots: Mapping[str, Any]) -> str:
-    location = str(slots.get("location_anchor", ""))
-    cuisine = slots.get("cuisine_preference", "餐厅")
-    # Search engines and public map geocoders treat party size / budget as
-    # noise.  Keep those as planning constraints and reduce a verbose anchor
-    # (e.g. “海淀区中关村领展购物广场附近”) to its searchable locality.
-    locality = next(
-        (candidate for candidate in ("中关村", "五道口", "望京", "国贸", "三里屯", "上地", "海淀") if candidate in location),
-        location,
-    )
-    return _safe_summary(f"{locality} {cuisine}")
-
-
-def _codex_user_visible_reply(provider_result: Any) -> str:
-    """Select a bounded Codex realization without giving it state ownership.
-
-    SlowTask has already emitted the state/evidence events before this function
-    runs.  The adapter summary can therefore control natural-language wording
-    and the order of questions, but cannot add facts, change missing fields,
-    advance a plan, or start a tool.
-    """
-
-    proposal = getattr(provider_result, "proposal", None)
-    if isinstance(proposal, Mapping) and proposal.get("proposal_type") == "clarification":
-        question_text = proposal.get("question_text")
-        if isinstance(question_text, str):
-            normalized_question = _safe_summary(question_text)
-            if normalized_question:
-                return normalized_question
-    candidate = proposal.get("summary") if isinstance(proposal, Mapping) else None
-    if isinstance(candidate, str):
-        normalized = _safe_summary(candidate)
-        internal_markers = (
-            "time_window",
-            "location_anchor",
-            "party_size",
-            "dietary_constraints",
-            "plan_version",
-            "task_event_seq",
-            "explicit_user_confirmation",
-        )
-        if normalized and not any(marker in normalized.lower() for marker in internal_markers):
-            return normalized
-    # This is a degraded adapter-safety message, not a domain-specific prompt.
-    # It is reachable only when the provider did not produce a valid safe
-    # realization candidate; SlowTask's journalled WAITING state remains intact.
-    return "当前模型没有生成可安全展示的说明；任务状态已保留，等待你补充相关信息后继续。"
-
-
-def _with_codex_user_visible_reply(
-    started: Mapping[str, str],
-    provider_result: Any,
-) -> dict[str, str]:
-    result = dict(started)
-    if result.get("status") == "tool_running":
-        result["assistant_summary"] = _codex_user_visible_reply(provider_result)
-    return result
-
-
 def _user_facing_final_plan(
     *,
     slots: Mapping[str, str],
     tool_payload: Mapping[str, Any] | None,
+    model: TaskRequirementModel,
+    plan_payload: Mapping[str, Any] | None,
 ) -> str:
-    """Render a grounded, customer-facing plan from current-plan evidence only."""
+    """Render any accepted task model without adding domain-specific facts."""
 
-    party_size = slots.get("party_size", "人数待最终确认")
-    time_window = slots.get("time_window", "具体到店时间待确认")
-    budget = slots.get("budget", "预算待确认")
-    dietary = _display_slot_value(slots.get("dietary_constraints", "忌口待确认"))
-    meal_type = slots.get("meal_type", "用餐")
-    cuisine = slots.get("cuisine_preference", "餐饮")
+    labels = model.requirements_by_id
+    fact_lines = [
+        f"- {labels[name].label}：{_display_slot_value(value)}"
+        for name, value in slots.items()
+        if name in labels
+    ]
+    ordered_steps = list(plan_payload.get("ordered_steps", ())) if isinstance(plan_payload, Mapping) else []
+    sections = [f"最终规划草案：{model.task_summary}"]
+    if fact_lines:
+        sections.append("已接受的条件：\n" + "\n".join(fact_lines))
+    if ordered_steps:
+        sections.append("执行步骤：\n" + "\n".join(f"{index + 1}. {_safe_summary(str(step))}" for index, step in enumerate(ordered_steps)))
     external_results = tool_payload.get("results", []) if isinstance(tool_payload, Mapping) else []
     if isinstance(external_results, Sequence) and external_results:
         candidates: list[str] = []
         for item in external_results[:3]:
             if not isinstance(item, Mapping):
                 continue
-            title = _safe_summary(str(item.get("source_title", "网页地点结果")))
+            title = _safe_summary(str(item.get("source_title", "网页检索结果")))
             url = _safe_summary(str(item.get("source_url", "")))
             snippet = _safe_summary(str(item.get("snippet_or_summary", "")))
             provider = _safe_summary(str(item.get("source_provider", "公开网页/地图")))
             if title and url:
                 candidates.append(f"- {title}：{snippet}（{provider}；来源：{url}）")
         if candidates:
-            return (
-                f"当前方案（{meal_type}接待）：{party_size}，建议时段为 {time_window}；"
-                f"菜系偏好为{cuisine}，预算按{budget}控制，并满足{dietary}。\n"
-                "本轮只读网页/地图检索返回了以下可核验候选（按“中关村 + 云南菜”检索，不能据此替代门店实时确认）：\n"
-                + "\n".join(candidates)
-                + "\n点菜时优先选择可做不辣或分开调味的菜品，并在联系门店前再次确认营业、余位、包间、菜单与价格。"
-                "这些网页摘要属于不可信外部证据；系统没有执行订位、支付或任何外部写操作。"
-            )
+            sections.append("只读工具返回的可核验候选：\n" + "\n".join(candidates))
     if isinstance(tool_payload, Mapping) and tool_payload.get("trust_level") == "UNTRUSTED_WEB_EVIDENCE":
         degraded_reason = _safe_summary(str(tool_payload.get("degraded_reason", "unknown")))
-        return (
-            f"我已按 {party_size}、{meal_type}、{budget} 和{dietary}发起只读网页/地图地点检索，"
-            "但当前外部来源没有返回可列名的候选，因此不会编造餐厅名称。"
-            f"本次检索状态：{degraded_reason or 'unknown'}。"
-            "系统已保留地点、人数、预算与忌口；你可以修改地点锚点或再次检索。系统不会执行真实订位。"
-        )
-    return (
-        f"最终规划草案：按 {party_size} 的{meal_type}接待处理，时间为 {time_window}，"
-        f"预算控制在{budget}，优先满足{dietary}，菜系偏好为{cuisine}。\n"
-        "当前尚未取得可验证的地点检索结果；请补充像“北京市海淀区中关村领展购物广场附近”这样的明确位置，或在本地 Codex 模式下重试只读地点检索。"
-    )
+        if degraded_reason:
+            sections.append(f"外部只读证据处于 degraded 状态：{degraded_reason}。")
+    sections.append("工具结果仅作为证据；系统没有执行预订、支付、消息发送或其他真实外部写操作。")
+    return "\n".join(sections)
 
 
 def _display_slot_value(value: Any) -> str:
     if isinstance(value, (list, tuple)):
-        return "无忌口" if not value else "、".join(str(item) for item in value)
+        return "无" if not value else "、".join(str(item) for item in value)
     return str(value)
 
 
@@ -2438,14 +2705,48 @@ def _user_facing_current_plan(
     *,
     slots: Mapping[str, str],
     tool_payload: Mapping[str, Any] | None,
+    model: TaskRequirementModel | None,
+    plan_payload: Mapping[str, Any] | None,
 ) -> str:
     """Make the non-terminal status explicit without changing grounded facts."""
 
+    if model is None:
+        return "当前任务模型尚未恢复，不能展示未验证的方案。"
     return (
         "当前可修改方案（尚未定稿）：\n"
-        + _user_facing_final_plan(slots=slots, tool_payload=tool_payload)
-        + "\n如需改时间、地点、人数、预算或忌口，直接告诉我；系统会在同一任务中生成新的 plan_version。"
+        + _user_facing_final_plan(slots=slots, tool_payload=tool_payload, model=model, plan_payload=plan_payload)
+        + "\n如需修改已接受条件，直接说明；SlowTask 会判断是否需要新的 plan_version。"
     )
+
+
+def _user_visible_role_result(
+    *,
+    status: str,
+    assistant_summary: str,
+    role_result: RoleInvocationResult,
+) -> dict[str, str]:
+    return {
+        "status": status,
+        "assistant_summary": assistant_summary,
+        "user_visible_source_role": role_result.role.value,
+        "user_visible_proposal_id": str(role_result.proposal["proposal_id"]),
+        "user_visible_context_hash": str(role_result.proposal["input_context_hash"]),
+        "user_visible_caused_by_event_id": str(role_result.structured_output_event["event_id"]),
+    }
+
+
+def _reviewer_block_user_summary(payload: Mapping[str, Any]) -> str:
+    if payload.get("premature_commitment") is True:
+        reason = "方案包含尚未得到证据支持的承诺"
+    elif payload.get("stale_evidence_usage"):
+        reason = "方案引用了旧计划证据"
+    elif payload.get("tool_binding_errors"):
+        reason = "方案中的工具参数未通过校验"
+    elif payload.get("missing_requirement_coverage"):
+        reason = "方案尚未覆盖已确认的必要条件"
+    else:
+        reason = "方案尚未通过安全与证据校验"
+    return f"{reason}。我已保留你确认的条件，但当前不会提交或执行这个方案。"
 
 
 def _provider_progress_phase(item: Mapping[str, Any]) -> str:

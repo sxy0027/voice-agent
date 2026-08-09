@@ -104,7 +104,7 @@ class WorkbenchApi:
                     "allow_local_codex_cli", WORKBENCH_DEFAULT_ALLOW_LOCAL_CODEX_CLI
                 ),
                 "codex_bin": payload.get("codex_bin", "codex"),
-                "timeout_seconds": payload.get("timeout_seconds", 30),
+                "timeout_seconds": payload.get("timeout_seconds", 60),
                 "model_name": payload.get("model_name"),
                 "reasoning_effort": payload.get("reasoning_effort"),
             }
