@@ -298,6 +298,7 @@ class SlowTaskRecord:
     evidence_events: tuple[RefEvent, ...] = ()
     resolved_arguments_refs: tuple[str, ...] = ()
     argument_provenance_refs: tuple[str, ...] = ()
+    tool_validation_reports: tuple[Mapping[str, Any], ...] = ()
     tool_calls: tuple[ToolCallMetadata, ...] = ()
     tool_results: tuple[ToolResultMetadata, ...] = ()
     pending_stale_tool_results: tuple[PendingStaleToolResult, ...] = ()
@@ -730,6 +731,9 @@ class SlowTaskState:
             )
             task.resolved_arguments_refs = _append_unique(task.resolved_arguments_refs, resolved_arguments_ref)
             task.argument_provenance_refs = _append_unique(task.argument_provenance_refs, provenance_ref)
+            report = event.get("tool_validation_report")
+            if isinstance(report, Mapping):
+                task.tool_validation_reports = (*task.tool_validation_reports, dict(report))
             refs = (resolved_arguments_ref, provenance_ref)
         elif event_name == "ARGUMENT_RESOLUTION_PROVENANCE":
             refs = _string_tuple(event.get("field_provenance_refs", ()))

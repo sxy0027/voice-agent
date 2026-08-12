@@ -101,16 +101,13 @@ def test_local_codex_invoker_passes_role_specific_prompt_and_schema(monkeypatch)
                             {
                                 "role": "CLARIFIER",
                                 "public_summary": "只询问后端选定字段",
-                                "payload_json": json.dumps(
-                                    {
-                                        "clarification_id": "clarification_real",
-                                        "question_text": "请补充目标读者。",
-                                        "covered_requirement_ids": ["target_audience"],
-                                        "expected_answer_shape": "简短文本",
-                                        "optional_examples": [],
-                                    },
-                                    ensure_ascii=False,
-                                ),
+                                "payload": {
+                                    "clarification_id": "clarification_real",
+                                    "question_text": "请补充目标读者。",
+                                    "covered_requirement_ids": ["target_audience"],
+                                    "expected_answer_shape": "简短文本",
+                                    "optional_examples": [],
+                                },
                             },
                             ensure_ascii=False,
                         )
@@ -135,7 +132,7 @@ def test_local_codex_invoker_passes_role_specific_prompt_and_schema(monkeypatch)
 
     assert result["payload"]["covered_requirement_ids"] == ["target_audience"]
     assert "Phrase only the backend-selected requirements" in captured["prompt"]
-    assert "Put the role payload as JSON text in payload_json" in captured["prompt"]
+    assert "payload must be a nested JSON object" in captured["prompt"]
     assert json.loads(captured["schema"])["properties"]["role"] == {
         "const": "CLARIFIER",
         "type": "string",
@@ -165,7 +162,7 @@ def test_real_jsonl_transport_extracts_each_role_with_its_own_schema(monkeypatch
                                     {
                                         "role": role.value,
                                         "public_summary": f"{role.value} transport",
-                                        "payload_json": "{}",
+                                        "payload": {},
                                     },
                                     ensure_ascii=False,
                                 ),
@@ -352,6 +349,7 @@ def test_planner_overreach_degrades_to_non_executable_draft(violation: str) -> N
             "plan_summary": "候选计划",
             "ordered_steps": ["形成计划"],
             "requirement_coverage": ["known"],
+            "tool_intents": [],
             "proposed_tool_calls": [],
             "unresolved_optional_items": [],
             "assumptions": [],
@@ -391,10 +389,16 @@ def test_planner_overreach_degrades_to_non_executable_draft(violation: str) -> N
             ),
         )
 
-        assert result.validation_status == "degraded"
-        assert result.proposal["payload"]["planning_mode"] == "DRAFT_PLAN"
-        assert result.proposal["payload"]["proposed_tool_calls"] == []
-        assert result.proposal["payload"]["ordered_steps"] == []
+        if violation == "unknown_tool":
+            # Raw low-level calls are compatibility diagnostics only; their
+            # tool and arguments are never trusted by generic runtime.
+            assert result.validation_status == "validated"
+            assert result.proposal["payload"]["proposed_tool_calls"]
+        else:
+            assert result.validation_status == "degraded"
+            assert result.proposal["payload"]["planning_mode"] == "DRAFT_PLAN"
+            assert result.proposal["payload"]["proposed_tool_calls"] == []
+            assert result.proposal["payload"]["ordered_steps"] == []
 
     asyncio.run(scenario())
 
@@ -420,5 +424,60 @@ def test_invalid_reviewer_output_fails_closed_as_block() -> None:
 
         assert result.validation_status == "degraded"
         assert result.proposal["payload"]["verdict"] == "BLOCK"
+
+    asyncio.run(scenario())
+
+
+def test_reviewer_cannot_override_python_tool_validation_pass_with_free_text() -> None:
+    async def provider(role, context, schema):
+        return {
+            "public_summary": "unsupported tool objection",
+            "payload": {
+                "verdict": "BLOCK",
+                "violations": [],
+                "missing_requirement_coverage": [],
+                "unsupported_claims": [],
+                "stale_evidence_usage": [],
+                "tool_binding_errors": ["query invalid"],
+                "premature_commitment": False,
+                "risk_notes": [],
+                "semantic_coverage_errors": [],
+                "referenced_tool_validation_report_id": "report_pass",
+            },
+        }
+
+    async def scenario() -> None:
+        session = WorkbenchSession(
+            session_id="test_reviewer_false_tool_positive",
+            config=WorkbenchRuntimeConfig(provider_mode="fake"),
+        )
+        adapter = CodexRoleAdapter(
+            boundary=session._boundary,
+            tool_registry=session._tool_registry,
+            provider_invoker=provider,
+        )
+        result = await adapter.invoke(
+            role=CodexRole.REVIEWER,
+            **_invocation(
+                session,
+                prefix="reviewer_false_tool_positive",
+                role_context={
+                    "plan_proposal": {"ordered_steps": ["x"]},
+                    "tool_validation_report": {
+                        "report_id": "report_pass",
+                        "status": "PASS",
+                        "reason_codes": ["DETERMINISTIC_ARGUMENT_COMPILATION_PASS"],
+                    },
+                },
+            ),
+        )
+
+        assert result.validation_status == "degraded"
+        assert result.validation_failed_event is not None
+        assert result.validation_failed_event["failure_reasons"] == [
+            "reviewer_contradicts_tool_validation_pass"
+        ]
+        assert result.proposal["payload"]["verdict"] == "BLOCK"
+        assert result.proposal["payload"]["tool_binding_errors"] == []
 
     asyncio.run(scenario())

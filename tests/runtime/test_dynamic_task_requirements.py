@@ -93,21 +93,12 @@ def test_degraded_provider_two_turn_customer_lunch_keeps_current_evidence_and_re
             "time_window", "cuisine_preference", "desired_deliverable", "key_constraint",
         } & set(second_task["selected_clarification_requirement_ids"])
 
-        assert [item["role"] for item in first_trace] == [
-            "TASK_MODELER", "REQUIREMENT_ANALYST", "CLARIFIER"
-        ]
-        assert [item["role"] for item in second_turn_trace] == [
-            "TASK_MODELER", "REQUIREMENT_ANALYST", "PLANNER", "REVIEWER"
-        ]
-        assert all(item["context_hash"] != first_trace[-1]["context_hash"] for item in second_turn_trace)
-        assert all(item["proposal_id"] != first_trace[-1]["proposal_id"] for item in second_turn_trace)
-        assert all(item["validation_status"] == "degraded" for item in second_turn_trace)
-        assert all(item["degraded_reason"] == "role_provider_failed" for item in second_turn_trace)
-
-        planner_trace = second_turn_trace[-2]
-        assert assistant_turn["source_role"] == "PLANNER"
-        assert assistant_turn["proposal_id"] == planner_trace["proposal_id"]
-        assert assistant_turn["context_hash"] == planner_trace["context_hash"]
+        assert [item["role"] for item in first_trace] == ["TASK_MODELER"]
+        assert second_turn_trace == []
+        assert second["status"] == "tool_running"
+        assert assistant_turn["source_role"] == "PYTHON_DETERMINISTIC"
+        assert second_task["latest_tool_validation_report"]["status"] == "PASS"
+        assert second_task["in_flight_tool_calls"][0]["tool_name"] == "webSearch"
         assert "最终产出" not in assistant_turn["text"]
         assert "最重要约束" not in assistant_turn["text"]
 
@@ -229,9 +220,10 @@ def test_model_validation_failure_remodeling_keeps_original_goal_context() -> No
         ]
 
         assert task["task_kind"] == "customer_reception"
-        assert task["task_requirement_model_version"] == 2
+        assert task["task_requirement_model_version"] == 1
         assert task["current_plan_version"] == 1
-        assert all(item["degraded_reason"] == "role_output_validation_failed" for item in modeler_trace)
+        assert len(modeler_trace) == 1
+        assert modeler_trace[0]["degraded_reason"] == "role_output_validation_failed"
         assert not {"desired_deliverable", "key_constraint"} & set(_requirements(second["snapshot"]))
         assert "最终产出" not in second["snapshot"]["conversation"][-1]["text"]
         assert "最重要约束" not in second["snapshot"]["conversation"][-1]["text"]
@@ -257,8 +249,10 @@ def test_clarifier_uses_current_turn_proposal_context_and_selected_requirements(
         assert second_selected == ["location_anchor", "party_size"]
         assert first_turn["proposal_id"] != second_turn["proposal_id"]
         assert first_turn["context_hash"] != second_turn["context_hash"]
-        assert second_turn["proposal_id"] == clarification_trace[-1]["proposal_id"]
-        assert second_turn["context_hash"] == clarification_trace[-1]["context_hash"]
+        assert clarification_trace == []
+        assert second_turn["source_role"] == "PYTHON_DETERMINISTIC_CLARIFIER"
+        assert second_turn["proposal_id"] == second["snapshot"]["codex_proposals"][-1]["proposal_id"]
+        assert second_turn["context_hash"] == second["snapshot"]["codex_proposals"][-1]["context_hash"]
         assert "接待时间" not in second_turn["text"]
         assert "位置范围" in second_turn["text"]
         assert "参与人数" in second_turn["text"]
@@ -320,13 +314,13 @@ def test_user_visible_reply_uses_clarifier_not_debug_public_summaries() -> None:
         assistant_turn = result["snapshot"]["conversation"][-1]
 
         assert trace[0]["role"] == "TASK_MODELER"
-        assert trace[1]["role"] == "REQUIREMENT_ANALYST"
-        assert trace[2]["role"] == "CLARIFIER"
-        assert assistant_turn["source_role"] == "CLARIFIER"
-        assert assistant_turn["proposal_id"] == trace[2]["proposal_id"]
-        assert assistant_turn["text"] == trace[2]["public_summary"]
+        assert len(trace) == 1
+        assert assistant_turn["source_role"] == "PYTHON_DETERMINISTIC_CLARIFIER"
+        proposal = result["snapshot"]["codex_proposals"][-1]
+        assert proposal["role"] == "PYTHON_DETERMINISTIC_CLARIFIER"
+        assert assistant_turn["proposal_id"] == proposal["proposal_id"]
+        assert assistant_turn["text"] == proposal["summary"]
         assert assistant_turn["text"] != trace[0]["public_summary"]
-        assert assistant_turn["text"] != trace[1]["public_summary"]
 
     asyncio.run(scenario())
 
@@ -382,7 +376,7 @@ def test_http_api_current_turn_response_cannot_reference_old_proposal_or_context
         assert second_reply["proposal_id"] != first_reply["proposal_id"]
         assert second_reply["context_hash"] != first_reply["context_hash"]
         assert second_reply["proposal_id"] == second["proposal"]["proposal_id"]
-        assert second_reply["source_role"] == "CLARIFIER"
+        assert second_reply["source_role"] == "PYTHON_DETERMINISTIC_CLARIFIER"
         assert second_reply["text"] == second["proposal"]["summary"]
         assert "接待时间" not in second_reply["text"]
 
@@ -400,7 +394,8 @@ def test_customer_reception_uses_modeler_analyst_and_selected_user_clarification
         assert snapshot["task"]["selected_clarification_requirement_ids"] == [
             "time_window", "location_anchor", "party_size"
         ]
-        assert _roles(snapshot) == ["TASK_MODELER", "REQUIREMENT_ANALYST", "CLARIFIER"]
+        assert _roles(snapshot) == ["TASK_MODELER"]
+        assert snapshot["codex_proposals"][-1]["role"] == "PYTHON_DETERMINISTIC_CLARIFIER"
         assert snapshot["task"]["in_flight_tool_calls"] == []
         assert snapshot["task"]["semantic_commitment"]["status"] == "not_emitted"
 
@@ -448,7 +443,7 @@ def test_code_refactor_reaches_reviewed_no_tool_plan() -> None:
         assert snapshot["task"]["planner_mode"] == "FINAL_PLAN_CANDIDATE"
         assert snapshot["task"]["reviewer_status"] == "PASS"
         assert snapshot["task"]["tool_calls"] == []
-        assert _roles(snapshot)[-3:] == ["REQUIREMENT_ANALYST", "PLANNER", "REVIEWER"]
+        assert _roles(snapshot)[-2:] == ["PLANNER", "REVIEWER"]
 
     asyncio.run(scenario())
 
@@ -481,7 +476,7 @@ def test_tool_gap_is_planned_for_tool_executor_and_never_asked_by_clarifier() ->
         assert _requirements(snapshot)["venue_options"]["source_route"] == "TOOL"
         assert snapshot["task"]["planner_mode"] == "INFORMATION_GATHERING"
         assert snapshot["task"]["in_flight_tool_calls"][0]["tool_name"] == "webSearch"
-        assert _roles(snapshot)[-3:] == ["REQUIREMENT_ANALYST", "PLANNER", "REVIEWER"]
+        assert _roles(snapshot) == ["TASK_MODELER"]
 
     asyncio.run(scenario())
 
@@ -550,22 +545,22 @@ def test_replay_restores_model_requirement_states_role_refs_and_reviewer_without
     asyncio.run(scenario())
 
 
-def test_ordinary_patch_obeys_three_call_budget_and_does_not_remodel_task() -> None:
+def test_ordinary_patch_uses_deterministic_extraction_and_does_not_remodel_task() -> None:
     async def scenario() -> None:
         session = _session("dynamic_call_budget")
         first = await session.process_message(
             "帮我给 voice-agent 设计一个代码重构计划。", action="start"
         )
         first_roles = _roles(first["snapshot"])
-        assert first_roles == ["TASK_MODELER", "REQUIREMENT_ANALYST", "CLARIFIER"]
+        assert first_roles == ["TASK_MODELER"]
 
         second = await session.process_message(
             "目标是降低模块耦合，必须保持现有 API 兼容，验收标准是全部测试通过。"
         )
         added_roles = _roles(second["snapshot"])[len(first_roles):]
 
-        assert added_roles == ["REQUIREMENT_ANALYST", "PLANNER", "REVIEWER"]
-        assert len(added_roles) <= 3
+        assert added_roles == ["PLANNER", "REVIEWER"]
+        assert len(added_roles) <= 2
         assert "TASK_MODELER" not in added_roles
         assert not ({"CLARIFIER", "PLANNER"} <= set(added_roles))
 

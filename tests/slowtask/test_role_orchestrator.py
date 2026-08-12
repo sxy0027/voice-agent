@@ -110,7 +110,8 @@ def test_planner_repair_is_bounded_to_one_and_roles_are_python_ordered() -> None
             CodexRole.PLANNER,
             CodexRole.REVIEWER,
         ]
-        assert len(run.invocations) == 4
+        assert len(run.invocations) == 2
+        assert len(run.repair_invocations) == 2
 
     asyncio.run(scenario())
 
@@ -125,3 +126,4 @@ def test_declared_workbench_budgets_remain_four_for_new_task_and_three_for_patch
     assert orchestrator.new_task_run().budget.max_invocations == 4
     assert orchestrator.patch_run().budget.max_invocations == 3
     assert orchestrator.new_task_run().budget.max_planner_repairs == 1
+    assert orchestrator.new_task_run().budget.max_repair_invocations == 2

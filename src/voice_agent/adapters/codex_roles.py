@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
 import json
+import time
 from typing import Any
 
 from voice_agent.runtime.adapter_callback_boundary import AdapterCallbackAppendBoundary
@@ -29,7 +30,7 @@ from voice_agent.tools.manifest import ToolExecutionPolicyError
 from voice_agent.tools.registry import ToolRegistry
 
 
-ROLE_CONTRACT_VERSION = "voice_agent.codex_role.v1"
+ROLE_CONTRACT_VERSION = "voice_agent.codex_role.v2"
 ROLE_ADAPTER_ID = "codex_role_adapter"
 ROLE_SCHEMA_PREFIX = "voice_agent.slowtask.role"
 MAX_PUBLIC_SUMMARY = 320
@@ -45,11 +46,18 @@ class CodexRole(str, Enum):
 
 
 ROLE_TIMEOUT_SECONDS: Mapping[CodexRole, int] = {
-    CodexRole.TASK_MODELER: 60,
-    CodexRole.REQUIREMENT_ANALYST: 45,
-    CodexRole.CLARIFIER: 30,
-    CodexRole.PLANNER: 60,
-    CodexRole.REVIEWER: 45,
+    CodexRole.TASK_MODELER: 30,
+    CodexRole.REQUIREMENT_ANALYST: 15,
+    CodexRole.CLARIFIER: 10,
+    CodexRole.PLANNER: 30,
+    CodexRole.REVIEWER: 20,
+}
+ROLE_REASONING_EFFORT: Mapping[CodexRole, str] = {
+    CodexRole.TASK_MODELER: "medium",
+    CodexRole.REQUIREMENT_ANALYST: "low",
+    CodexRole.CLARIFIER: "low",
+    CodexRole.PLANNER: "medium",
+    CodexRole.REVIEWER: "low",
 }
 
 
@@ -107,6 +115,7 @@ class CodexRoleAdapter:
         created_monotonic_ms: int,
         created_wall_clock_ms: int,
     ) -> RoleInvocationResult:
+        role_started = time.perf_counter()
         context_projection = minimal_role_context(role, task_context_pack, role_context)
         context_hash = _context_hash(context_projection)
         request_id = f"{event_id_prefix}_{role.value.lower()}_request"
@@ -115,7 +124,11 @@ class CodexRoleAdapter:
         if self._provider_invoker is not None:
             try:
                 raw = await asyncio.wait_for(
-                    self._provider_invoker(role, context_projection, role_output_schema(role)),
+                    self._provider_invoker(
+                        role,
+                        context_projection,
+                        role_output_schema(role, role_context=role_context),
+                    ),
                     timeout=ROLE_TIMEOUT_SECONDS[role],
                 )
                 output_mode = "real"
@@ -240,6 +253,7 @@ class CodexRoleAdapter:
             "validation_status": validation_status,
             "degraded_reason": degraded_reason,
             "blocked_on_user": role == CodexRole.CLARIFIER,
+            "latency_ms": max(0, int((time.perf_counter() - role_started) * 1000)),
         }
         return RoleInvocationResult(
             role=role,
@@ -328,9 +342,36 @@ class CodexRoleAdapter:
             tool_gaps = tuple(str(value) for value in context.get("tool_gap_ids", ()))
             model = context.get("task_requirement_model", {})
             specs = {item["requirement_id"]: item for item in model.get("requirements", ())}
+            allowed_contracts = {
+                str(item.get("binding_id")): item
+                for item in context.get("allowed_tool_contracts", ())
+                if isinstance(item, Mapping)
+            }
+            tool_intents: list[dict[str, Any]] = []
             proposed_calls: list[dict[str, Any]] = []
             for requirement_id in tool_gaps[:1]:
                 bindings = specs.get(requirement_id, {}).get("tool_bindings", ())
+                allowed = next(
+                    (
+                        item for item in allowed_contracts.values()
+                        if requirement_id in item.get("resolves_requirement_ids", ())
+                    ),
+                    None,
+                )
+                if allowed is not None:
+                    facets = [
+                        str(value)
+                        for value in allowed.get("input_requirement_ids", ())
+                        if str(value) in context.get("accepted_facts", {})
+                    ]
+                    tool_intents.append(
+                        {
+                            "binding_id": str(allowed["binding_id"]),
+                            "resolves_requirement_ids": [requirement_id],
+                            "query_facets": facets,
+                            "reason": "需要取得当前 TOOL gap 的只读证据",
+                        }
+                    )
                 if bindings:
                     binding = bindings[0]
                     accepted_facts = context.get("accepted_facts", {})
@@ -357,6 +398,7 @@ class CodexRoleAdapter:
                 "plan_summary": f"为 {model.get('task_summary', '当前任务')} 生成受约束的计划候选。",
                 "ordered_steps": [f"步骤 {index + 1}：{criterion}" for index, criterion in enumerate(criteria)] or ["确认目标和约束", "形成可验证的执行步骤"],
                 "requirement_coverage": list(context.get("resolved_requirement_ids", ())),
+                "tool_intents": tool_intents,
                 "proposed_tool_calls": proposed_calls,
                 "unresolved_optional_items": [],
                 "assumptions": [],
@@ -376,6 +418,12 @@ class CodexRoleAdapter:
                 "tool_binding_errors": [],
                 "premature_commitment": False,
                 "risk_notes": [],
+                "semantic_coverage_errors": [],
+                "referenced_tool_validation_report_id": (
+                    context.get("tool_validation_report", {}).get("report_id")
+                    if isinstance(context.get("tool_validation_report"), Mapping)
+                    else None
+                ),
             }
             if not plan:
                 payload["verdict"] = "BLOCK"
@@ -446,6 +494,8 @@ class CodexRoleAdapter:
                 "tool_binding_errors": [],
                 "premature_commitment": False,
                 "risk_notes": [reason[:120]],
+                "semantic_coverage_errors": [],
+                "referenced_tool_validation_report_id": None,
             }
             return _envelope(role, task_binding, refs, context_hash, payload, "Reviewer 输出无效，已按 BLOCK 处理。")
         if role == CodexRole.PLANNER:
@@ -454,6 +504,7 @@ class CodexRoleAdapter:
                 "plan_summary": "Planner 输出无效，未形成可提交方案。",
                 "ordered_steps": [],
                 "requirement_coverage": [],
+                "tool_intents": [],
                 "proposed_tool_calls": [],
                 "unresolved_optional_items": [],
                 "assumptions": [],
@@ -467,7 +518,11 @@ class CodexRoleAdapter:
         return self._fake_output(role, role_context, task_binding, refs, context_hash)
 
 
-def role_output_schema(role: CodexRole) -> Mapping[str, Any]:
+def role_output_schema(
+    role: CodexRole,
+    *,
+    role_context: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
     assertion_names = (
         "no_state_mutation", "no_plan_version_advance", "no_tool_execution",
         "no_tool_authorization", "no_semantic_commitment", "no_ui_mutation",
@@ -498,7 +553,7 @@ def role_output_schema(role: CodexRole) -> Mapping[str, Any]:
             },
             "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
             "public_summary": {"type": "string", "maxLength": MAX_PUBLIC_SUMMARY},
-            "payload": _role_payload_schema(role),
+            "payload": _role_payload_schema(role, role_context=role_context),
             "boundary_assertions": {
                 "type": "object",
                 "required": list(assertion_names),
@@ -509,7 +564,11 @@ def role_output_schema(role: CodexRole) -> Mapping[str, Any]:
     }
 
 
-def _role_payload_schema(role: CodexRole) -> Mapping[str, Any]:
+def _role_payload_schema(
+    role: CodexRole,
+    *,
+    role_context: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
     text = {"type": "string", "maxLength": 240}
     token = {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}
     string_list = {"type": "array", "maxItems": 24, "items": text}
@@ -604,17 +663,65 @@ def _role_payload_schema(role: CodexRole) -> Mapping[str, Any]:
         }
         required = list(properties)
     elif role == CodexRole.PLANNER:
+        role_context = role_context or {}
+        allowed_binding_ids = [
+            str(item.get("binding_id"))
+            for item in role_context.get("allowed_tool_contracts", ())
+            if isinstance(item, Mapping) and item.get("binding_id")
+        ]
+        active_tool_gaps = [str(value) for value in role_context.get("tool_gap_ids", ())]
+        accepted_requirement_ids = [
+            str(item.get("requirement_id"))
+            for item in role_context.get("accepted_fact_inputs", ())
+            if isinstance(item, Mapping) and item.get("requirement_id")
+        ]
         call_properties = {
             "tool_name": text,
             "arguments": {"type": "object"},
             "argument_provenance": {"type": "object"},
             "resolves_requirement_ids": {"type": "array", "maxItems": 24, "items": token},
         }
+        intent_properties = {
+            "binding_id": (
+                {"type": "string", "enum": allowed_binding_ids}
+                if allowed_binding_ids
+                else token
+            ),
+            "resolves_requirement_ids": {
+                "type": "array",
+                "maxItems": 24,
+                "items": (
+                    {"type": "string", "enum": active_tool_gaps}
+                    if active_tool_gaps
+                    else token
+                ),
+            },
+            "query_facets": {
+                "type": "array",
+                "maxItems": 24,
+                "items": (
+                    {"type": "string", "enum": accepted_requirement_ids}
+                    if accepted_requirement_ids
+                    else token
+                ),
+            },
+            "reason": text,
+        }
         properties = {
             "planning_mode": {"enum": ["INFORMATION_GATHERING", "DRAFT_PLAN", "FINAL_PLAN_CANDIDATE"]},
             "plan_summary": {"type": "string", "maxLength": 320},
             "ordered_steps": string_list,
             "requirement_coverage": {"type": "array", "maxItems": 24, "items": token},
+            "tool_intents": {
+                "type": "array",
+                "maxItems": len(allowed_binding_ids) if role_context is not None else 8,
+                "items": {
+                    "type": "object",
+                    "required": list(intent_properties),
+                    "properties": intent_properties,
+                    "additionalProperties": False,
+                },
+            },
             "proposed_tool_calls": {
                 "type": "array", "maxItems": 8,
                 "items": {
@@ -639,6 +746,11 @@ def _role_payload_schema(role: CodexRole) -> Mapping[str, Any]:
             "tool_binding_errors": string_list,
             "premature_commitment": {"type": "boolean"},
             "risk_notes": string_list,
+            "semantic_coverage_errors": string_list,
+            "referenced_tool_validation_report_id": {
+                "type": ["string", "null"],
+                "maxLength": 160,
+            },
         }
         required = list(properties)
     return {
@@ -662,8 +774,8 @@ def make_codex_cli_role_invoker(config: Any) -> ProviderInvoker:
         prompt = "\n".join(
             (
                 role_prompt(role),
-                "Return only JSON matching the transport schema. Put the role payload as JSON text in payload_json.",
-                "The decoded payload_json must satisfy this role payload contract: "
+                "Return only JSON matching the transport schema. The role payload must be a nested JSON object.",
+                "The nested payload must satisfy this role payload contract: "
                 + json.dumps(
                     schema["properties"]["payload"],
                     ensure_ascii=True,
@@ -677,11 +789,19 @@ def make_codex_cli_role_invoker(config: Any) -> ProviderInvoker:
                 ),
             )
         )
-        stdout, _ = await _run_codex_cli_async(
+        role_config = replace(
             config,
+            reasoning_effort=ROLE_REASONING_EFFORT[role],
+            timeout_seconds=min(int(config.timeout_seconds), ROLE_TIMEOUT_SECONDS[role]),
+        )
+        stdout, _ = await _run_codex_cli_async(
+            role_config,
             prompt,
             output_schema_json=json.dumps(
-                _role_transport_schema(role),
+                _role_transport_schema(
+                    role,
+                    payload_schema=schema["properties"]["payload"],
+                ),
                 ensure_ascii=True,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -695,18 +815,19 @@ def make_codex_cli_role_invoker(config: Any) -> ProviderInvoker:
     return invoke
 
 
-def _role_transport_schema(role: CodexRole) -> Mapping[str, Any]:
+def _role_transport_schema(
+    role: CodexRole,
+    *,
+    payload_schema: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["role", "public_summary", "payload_json"],
+        "required": ["role", "public_summary", "payload"],
         "properties": {
             "role": {"type": "string", "const": role.value},
             "public_summary": {"type": "string", "maxLength": MAX_PUBLIC_SUMMARY},
-            "payload_json": {
-                "type": "string",
-                "description": f"Decoded JSON object for the {role.value} payload contract.",
-            },
+            "payload": dict(payload_schema or _role_payload_schema(role)),
         },
     }
 
@@ -767,8 +888,8 @@ def role_prompt(role: CodexRole) -> str:
         CodexRole.TASK_MODELER: "Model the user's task as bounded declarative requirements. Return a proposal only.",
         CodexRole.REQUIREMENT_ANALYST: "Propose requirement statuses from cited evidence. Do not mutate task state.",
         CodexRole.CLARIFIER: "Phrase only the backend-selected requirements as a short voice question.",
-        CodexRole.PLANNER: "Propose a plan and allow-listed tool calls. Never execute or authorize tools.",
-        CodexRole.REVIEWER: "Review the plan for coverage, stale evidence, unsupported claims, and tool errors.",
+        CodexRole.PLANNER: "Propose a semantic plan and high-level allow-listed tool intents. Never write low-level tool arguments, execute, or authorize tools.",
+        CodexRole.REVIEWER: "Review semantic coverage, stale evidence, unsupported claims, and commitment risk. Python ToolValidationReport owns tool validity.",
     }[role]
 
 
@@ -781,8 +902,17 @@ def minimal_role_context(role: CodexRole, task_context: Mapping[str, Any], role_
         ),
         CodexRole.REQUIREMENT_ANALYST: ("task_requirement_model", "requirement_summary", "evidence_text", "source_evidence_refs", "stale_evidence_refs"),
         CodexRole.CLARIFIER: ("selected_requirement_ids", "selected_labels", "selected_descriptions", "reason", "asked_counts", "recent_user_input", "max_questions", "max_fields"),
-        CodexRole.PLANNER: ("task_requirement_model", "task_summary", "resolved_requirement_ids", "accepted_facts", "tool_gap_ids", "current_plan_evidence", "stale_evidence_refs", "available_tool_manifest_summaries", "success_criteria", "planner_mode"),
-        CodexRole.REVIEWER: ("task_requirement_model", "accepted_facts", "plan_proposal", "source_evidence_refs", "stale_evidence_refs", "available_tool_manifest_summaries"),
+        CodexRole.PLANNER: (
+            "task_requirement_model", "task_summary", "resolved_requirement_ids",
+            "accepted_facts", "accepted_fact_inputs", "tool_gap_ids",
+            "allowed_tool_contracts", "current_plan_evidence", "stale_evidence_refs",
+            "success_criteria", "planner_mode",
+        ),
+        CodexRole.REVIEWER: (
+            "task_requirement_model", "accepted_facts", "plan_proposal",
+            "source_evidence_refs", "stale_evidence_refs", "tool_validation_report",
+            "normalized_tool_intent", "accepted_requirement_coverage",
+        ),
     }[role]
     for key in allowed:
         if key in role_context:
@@ -808,8 +938,11 @@ def validate_role_proposal(
         raise CodexRoleValidationError("task_binding_mismatch")
     if expected_context_hash is not None and proposal.get("input_context_hash") != expected_context_hash:
         raise CodexRoleValidationError("input_context_hash_mismatch")
-    if expected_source_evidence_refs is not None and tuple(proposal.get("source_evidence_refs", ())) != tuple(expected_source_evidence_refs):
-        raise CodexRoleValidationError("source_evidence_refs_mismatch")
+    if expected_source_evidence_refs is not None:
+        allowed_refs = set(str(ref) for ref in expected_source_evidence_refs)
+        proposed_refs = tuple(str(ref) for ref in proposal.get("source_evidence_refs", ()))
+        if proposed_refs and not set(proposed_refs).issubset(allowed_refs):
+            raise CodexRoleValidationError("source_evidence_refs_mismatch")
     assertions = proposal.get("boundary_assertions")
     required_assertions = {
         "no_state_mutation", "no_plan_version_advance", "no_tool_execution", "no_tool_authorization",
@@ -883,18 +1016,40 @@ def validate_role_proposal(
         coverage = set(str(value) for value in payload.get("requirement_coverage", ()))
         if not coverage.issubset(resolved):
             raise CodexRoleValidationError("planner_assumed_unknown_requirement")
+        active_gaps = set(str(value) for value in role_context.get("tool_gap_ids", ()))
+        allowed_contracts = {
+            str(item.get("binding_id")): item
+            for item in role_context.get("allowed_tool_contracts", ())
+            if isinstance(item, Mapping) and item.get("binding_id")
+        }
+        accepted_fact_ids = {
+            str(item.get("requirement_id"))
+            for item in role_context.get("accepted_fact_inputs", ())
+            if isinstance(item, Mapping)
+        }
+        for intent in payload.get("tool_intents", ()):
+            if not isinstance(intent, Mapping):
+                raise CodexRoleValidationError("planner_tool_intent_must_be_object")
+            binding_id = str(intent.get("binding_id", ""))
+            contract = allowed_contracts.get(binding_id)
+            if contract is None:
+                raise CodexRoleValidationError("planner_tool_binding_not_allowed")
+            resolves = set(str(value) for value in intent.get("resolves_requirement_ids", ()))
+            if not resolves or not resolves.issubset(active_gaps):
+                raise CodexRoleValidationError("planner_tool_intent_not_active_gap")
+            if not resolves.issubset(
+                set(str(value) for value in contract.get("resolves_requirement_ids", ()))
+            ):
+                raise CodexRoleValidationError("planner_tool_intent_binding_mismatch")
+            facets = set(str(value) for value in intent.get("query_facets", ()))
+            if not facets.issubset(accepted_fact_ids):
+                raise CodexRoleValidationError("planner_query_facet_not_accepted")
+        # Compatibility-only raw calls are diagnostic candidates.  Generic
+        # runtime never trusts their tool or arguments and rebuilds from the
+        # selected Python contract.
         for call in payload.get("proposed_tool_calls", ()):
             if not isinstance(call, Mapping):
                 raise CodexRoleValidationError("planner_tool_call_must_be_object")
-            try:
-                manifest = tool_registry.get(str(call.get("tool_name", "")))
-            except ToolExecutionPolicyError as exc:
-                raise CodexRoleValidationError("planner_unknown_tool") from exc
-            arguments = call.get("arguments", {})
-            if not isinstance(arguments, Mapping) or any(name not in {*manifest.required_arguments, *manifest.optional_arguments} for name in arguments):
-                raise CodexRoleValidationError("planner_unknown_tool_argument")
-            if any(name not in arguments for name in manifest.required_arguments):
-                raise CodexRoleValidationError("planner_missing_required_tool_argument")
         forbidden = ("已预订", "已付款", "已发送", "booking completed", "payment completed")
         public_plan_parts = [
             str(payload.get("plan_summary", "")),
@@ -902,8 +1057,22 @@ def validate_role_proposal(
         ]
         if any(_claims_external_side_effect(part, forbidden) for part in public_plan_parts):
             raise CodexRoleValidationError("planner_claimed_external_side_effect")
-    elif role == CodexRole.REVIEWER and payload.get("verdict") not in {"PASS", "REVISE", "BLOCK"}:
-        raise CodexRoleValidationError("invalid_reviewer_verdict")
+    elif role == CodexRole.REVIEWER:
+        if payload.get("verdict") not in {"PASS", "REVISE", "BLOCK"}:
+            raise CodexRoleValidationError("invalid_reviewer_verdict")
+        report = role_context.get("tool_validation_report")
+        tool_errors = tuple(str(value) for value in payload.get("tool_binding_errors", ()))
+        referenced_report_id = payload.get("referenced_tool_validation_report_id")
+        if tool_errors:
+            if not isinstance(report, Mapping):
+                raise CodexRoleValidationError("reviewer_ungrounded_tool_block")
+            if report.get("status") == "PASS":
+                raise CodexRoleValidationError("reviewer_contradicts_tool_validation_pass")
+            if referenced_report_id != report.get("report_id"):
+                raise CodexRoleValidationError("reviewer_tool_report_reference_mismatch")
+            reason_codes = set(str(value) for value in report.get("reason_codes", ()))
+            if not reason_codes or not any(code in tool_errors for code in reason_codes):
+                raise CodexRoleValidationError("reviewer_tool_error_reason_ungrounded")
 
 
 def _normalize_envelope(raw: Mapping[str, Any], *, role: CodexRole, task_binding: Mapping[str, Any], source_evidence_refs: Sequence[str], input_context_hash: str) -> dict[str, Any]:

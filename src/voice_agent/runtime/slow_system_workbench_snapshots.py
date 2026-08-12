@@ -362,6 +362,12 @@ def _public_task(
         "pending_confirmation": pending,
         "in_flight_tool_calls": [call for call in tool_calls if call["status"] not in {"RESULT_RECEIVED", "FAILED", "CANCELLED"}],
         "tool_calls": tool_calls,
+        "tool_validation_reports": deepcopy(list(task.tool_validation_reports[-12:])),
+        "latest_tool_validation_report": (
+            deepcopy(dict(task.tool_validation_reports[-1]))
+            if task.tool_validation_reports
+            else None
+        ),
         "semantic_commitment": {
             "status": "emitted" if task.semantic_commitments else "not_emitted",
             "commitment_id": task.semantic_commitments[-1].commitment_id if task.semantic_commitments else None,

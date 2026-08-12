@@ -1442,6 +1442,7 @@ class MockSlowTaskRuntime:
         resolved_arguments_ref: str | None = None,
         provenance_ref: str | None = None,
         field_provenance_refs: Sequence[str] = (),
+        resolved_arguments_metadata: Mapping[str, Any] | None = None,
         clarification_prompt_ref: str | None = None,
         resolution_reason: str = "mock_context_resolution",
     ) -> MockSlowTaskRunResult:
@@ -1619,6 +1620,7 @@ class MockSlowTaskRuntime:
             next_task_event_seq += 1
             next_time_offset += 1
 
+        arguments_metadata = dict(resolved_arguments_metadata or {})
         arguments_resolved = self._append_slowtask_event(
             event_name="ARGUMENTS_RESOLVED",
             event_id=f"{event_id_prefix}_arguments_resolved",
@@ -1630,6 +1632,7 @@ class MockSlowTaskRuntime:
             task_event_seq=next_task_event_seq,
             resolved_arguments_ref=resolved_arguments_ref,
             provenance_ref=provenance_ref,
+            **arguments_metadata,
         )
         produced_events.append(arguments_resolved)
         previous_event_id = str(arguments_resolved["event_id"])

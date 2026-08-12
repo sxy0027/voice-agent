@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import threading
+import time
 
 from voice_agent.runtime.slow_system_workbench_api import WorkbenchApi
 from voice_agent.adapters import codex_slow_llm
@@ -18,6 +20,122 @@ from voice_agent.runtime.slow_system_workbench_sessions import (
     WorkbenchSessionManager,
 )
 from voice_agent.adapters.workbench_place_search import PlaceSearchEvidence
+from voice_agent.state.slowtask_state import SlowTaskState
+
+
+async def _wait_for_lifecycle(session: WorkbenchSession, lifecycle: str) -> dict[str, object]:
+    for _ in range(100):
+        snapshot = await session.snapshot()
+        if snapshot.get("task") and snapshot["task"]["lifecycle"] == lifecycle:
+            return snapshot
+        await asyncio.sleep(0)
+    raise AssertionError(f"session did not reach lifecycle {lifecycle}")
+
+
+async def _wait_for_planner(session: WorkbenchSession) -> dict[str, object]:
+    for _ in range(100):
+        snapshot = await session.snapshot()
+        if snapshot.get("task") and snapshot["task"].get("current_plan_proposal_ref"):
+            return snapshot
+        await asyncio.sleep(0)
+    raise AssertionError("session did not publish a current Planner proposal")
+
+
+def test_exact_three_turn_customer_reception_uses_deterministic_tool_fast_path() -> None:
+    async def scenario() -> None:
+        session = WorkbenchSession(
+            session_id="exact_three_turn_customer_reception",
+            config=WorkbenchRuntimeConfig(provider_mode="fake"),
+        )
+        trace_cursor = 0
+
+        started = time.perf_counter()
+        first = await session.process_message(
+            "请帮忙规划一个接待午饭，选云南菜。",
+            action="start",
+        )
+        first_elapsed_ms = int((time.perf_counter() - started) * 1000)
+        first_trace = first["snapshot"]["provider_trace"][trace_cursor:]
+        trace_cursor = len(first["snapshot"]["provider_trace"])
+
+        started = time.perf_counter()
+        second = await session.process_message(
+            "8个人，地点在北京市海淀区中关村领展购物广场附近，人均200以内，有两位不吃辣，最好12点半。"
+        )
+        second_elapsed_ms = int((time.perf_counter() - started) * 1000)
+        second_trace = second["snapshot"]["provider_trace"][trace_cursor:]
+        trace_cursor = len(second["snapshot"]["provider_trace"])
+        second_task = second["snapshot"]["task"]
+        second_report = second_task["latest_tool_validation_report"]
+        second_query = second["snapshot"]["context_pack"]["resolved_arguments"]["synthetic_values"]["query"]
+
+        started = time.perf_counter()
+        third = await session.process_message("中间我插一句，把时间修改到晚上吧。")
+        third_elapsed_ms = int((time.perf_counter() - started) * 1000)
+        third_trace = third["snapshot"]["provider_trace"][trace_cursor:]
+        third_task = third["snapshot"]["task"]
+        third_query = third["snapshot"]["context_pack"]["resolved_arguments"]["synthetic_values"]["query"]
+
+        assert first["status"] == "waiting_for_slot"
+        assert first["snapshot"]["task"]["task_kind"] == "customer_reception"
+        assert first["snapshot"]["task"]["missing_fields"] == ["location_anchor", "party_size"]
+        assert "位置范围" in first["snapshot"]["conversation"][-1]["text"]
+        assert "参与人数" in first["snapshot"]["conversation"][-1]["text"]
+        assert [item["role"] for item in first_trace if item.get("role")] == ["TASK_MODELER"]
+
+        assert second["status"] == "tool_running"
+        assert "工具参数未通过校验" not in second["snapshot"]["conversation"][-1]["text"]
+        assert [item["role"] for item in second_trace if item.get("role")] == []
+        assert second_report["status"] == "PASS"
+        assert second_report["tool_name"] == "webSearch"
+        assert second_report["provided_arguments"] == ["query"]
+        assert all(value in second_query for value in (
+            "北京市海淀区中关村领展购物广场附近", "云南菜", "8人",
+            "人均200以内", "两位不吃辣", "12:30",
+        ))
+        second_events = [event["event_name"] for event in second["snapshot"]["timeline"]]
+        assert "TOOL_MANIFEST_LOADED" in second_events
+        assert "TOOL_ARGUMENTS_READY" in second_events
+        assert "TOOL_EXECUTION_STARTED" in second_events
+        provenance_refs = second["snapshot"]["context_pack"]["resolved_arguments"]["provenance_refs"]
+        assert any("user_" in ref for ref in provenance_refs)
+        assert any("patch_" in ref for ref in provenance_refs)
+
+        assert third_task["current_plan_version"] == second_task["current_plan_version"] + 1
+        assert [item["role"] for item in third_trace if item.get("role")] == []
+        assert "晚上" in third_query
+        assert "12:30" not in third_query
+        requirements = {
+            item["requirement_id"]: item for item in third_task["requirement_summary"]
+        }
+        assert {
+            "party_size", "location_anchor", "budget", "dietary_constraints",
+            "cuisine_preference", "time_window",
+        } <= {key for key, item in requirements.items() if item["status"] == "RESOLVED"}
+        assert any(
+            event["event_name"] == "TOOL_RESULT_MARKED_STALE"
+            for event in third["snapshot"]["timeline"]
+        )
+
+        replayed = SlowTaskState()
+        for event in session.journal.events():
+            replayed.reduce_event(event)
+        replayed_task = replayed.tasks[third_task["task_id"]]
+        assert replayed_task.current_plan_version == third_task["current_plan_version"]
+        assert replayed_task.tool_validation_reports[-1]["argument_fingerprint"] == (
+            third_task["latest_tool_validation_report"]["argument_fingerprint"]
+        )
+        assert replayed_task.stale_evidence_refs
+
+        # Fake-clock/provider instrumentation should remain comfortably under
+        # the interactive SLO while exposing safe per-stage latency metadata.
+        assert max(first_elapsed_ms, second_elapsed_ms, third_elapsed_ms) < 1000
+        assert any(
+            item.get("kind") == "tool_validation_report" and item.get("latency_ms") is not None
+            for item in second["snapshot"]["live_progress"]
+        )
+
+    asyncio.run(scenario())
 
 
 def test_python_owned_session_starts_dynamic_tool_phase_with_fake_codex() -> None:
@@ -47,9 +165,8 @@ def test_python_owned_session_starts_dynamic_tool_phase_with_fake_codex() -> Non
         assert snapshot["provider_trace"][-1]["output_mode"] == "fake"
         assert snapshot["safety"]["raw_provider_body_included"] is False
         user_visible_reply = snapshot["conversation"][-1]["text"]
-        proposal_summary = snapshot["codex_proposals"][-1]["summary"]
-        assert "Tool Executor" in user_visible_reply
-        assert proposal_summary
+        assert "确定性编译并校验" in user_visible_reply
+        assert snapshot["task"]["latest_tool_validation_report"]["status"] == "PASS"
         assert "synthetic company fixture" not in user_visible_reply
         assert "fixture" not in user_visible_reply
         assert "行程候选" not in user_visible_reply
@@ -115,14 +232,18 @@ def test_workbench_remembers_user_supplied_slots_across_turns() -> None:
         assert supplied_snapshot["task"]["current_plan_version"] == 1
         assert supplied_snapshot["task"]["missing_fields"] == []
         assert supplied_snapshot["task"]["in_flight_tool_calls"]
-        assert set(supplied_snapshot["codex_proposals"][-1]["known_fields"]) >= {
+        resolved_requirements = {
+            item["requirement_id"]
+            for item in supplied_snapshot["task"]["requirement_summary"]
+            if item["status"] == "RESOLVED"
+        }
+        assert resolved_requirements >= {
             "location_anchor",
             "time_window",
             "party_size",
         }
-        assert supplied_snapshot["codex_proposals"][-1]["missing_fields"] == []
-        assert "Tool Executor" in supplied_snapshot["conversation"][-1]["text"]
-        assert supplied_snapshot["codex_proposals"][-1]["summary"]
+        assert supplied_snapshot["task"]["missing_fields"] == []
+        assert "确定性编译并校验" in supplied_snapshot["conversation"][-1]["text"]
 
         plan_version = supplied_snapshot["task"]["current_plan_version"]
         complaint = await session.process_message("我不是已经把信息给你了吗")
@@ -313,7 +434,7 @@ def test_workbench_environment_defaults_to_local_codex_cli(monkeypatch) -> None:
     assert config.provider_mode == "codex_cli_local"
     assert config.allow_local_codex_cli is True
     assert config.model_name is None
-    assert config.reasoning_effort == "high"
+    assert config.reasoning_effort == "medium"
 
 
 def test_workbench_environment_allows_codex_model_override(monkeypatch) -> None:
@@ -326,11 +447,11 @@ def test_workbench_environment_allows_codex_model_override(monkeypatch) -> None:
     assert config.reasoning_effort == "medium"
 
 
-def test_workbench_mapping_uses_cli_default_model_and_high_reasoning() -> None:
+def test_workbench_mapping_uses_cli_default_model_and_medium_reasoning() -> None:
     config = WorkbenchRuntimeConfig.from_mapping({})
 
     assert config.model_name is None
-    assert config.reasoning_effort == "high"
+    assert config.reasoning_effort == "medium"
 
 
 def test_local_codex_cli_passes_output_schema_as_short_lived_file(monkeypatch) -> None:
@@ -493,7 +614,12 @@ def test_local_codex_cli_reports_allowlisted_jsonl_progress_without_raw_text(mon
 
     assert stdout.count("\n") == 2
     assert stderr == ""
-    assert [item["kind"] for item in progress] == ["thread.started", "item.completed"]
+    assert [item["kind"] for item in progress] == [
+        "subprocess_startup",
+        "thread.started",
+        "item.completed",
+    ]
+    assert isinstance(progress[0]["latency_ms"], int)
     assert all("text" not in item for item in progress)
 
 
@@ -698,15 +824,149 @@ def test_local_workbench_auto_publishes_a_mutable_current_plan_from_place_search
             "请规划 8 人客户晚餐，选云南菜；地点在北京市海淀区中关村领展购物广场附近，晚上 18 点半，人均 200 元以内，两位不吃辣。",
             action="start",
         )
-        snapshot = result["snapshot"]
+        assert result["status"] == "tool_running"
+        assert result["snapshot"]["task"]["lifecycle"] == "EXECUTING"
+        await _wait_for_lifecycle(session, "PLANNING")
+        snapshot = await _wait_for_planner(session)
 
-        assert result["status"] == "current_plan_ready"
         assert snapshot["task"]["lifecycle"] == "PLANNING"
         assert any(call["tool_name"] == "webSearch" for call in snapshot["task"]["tool_calls"])
         assert "可验证的云南菜候选" in snapshot["conversation"][-1]["text"]
         assert "云海肴" not in snapshot["conversation"][-1]["text"]
         assert any(item["source"] == "web_search" for item in snapshot["task"]["evidence"])
+        assert [
+            item["role"] for item in snapshot["provider_trace"] if item.get("role")
+        ][-1:] == ["PLANNER"]
+        assert snapshot["task"]["reviewer_status"] is None
         assert not any(event["event_name"] == "SEMANTIC_COMMITMENT_EMITTED" for event in snapshot["timeline"])
+
+    asyncio.run(scenario())
+
+
+def test_background_search_does_not_hold_session_lock_during_material_patch() -> None:
+    async def scenario() -> None:
+        session = WorkbenchSession(
+            session_id="test_background_search_patch_lock",
+            config=WorkbenchRuntimeConfig(
+                provider_mode="codex_cli_local",
+                allow_local_codex_cli=False,
+            ),
+        )
+        session._role_adapter._provider_mode = "fake"
+        search_started = threading.Event()
+        release_search = threading.Event()
+
+        class BlockingPlaceSearch:
+            def search(self, *, query: str) -> PlaceSearchEvidence:
+                search_started.set()
+                release_search.wait(timeout=5)
+                return PlaceSearchEvidence(
+                    query=query,
+                    provider="synthetic_blocking_read",
+                    results=(),
+                    degraded_reason="synthetic_no_results",
+                )
+
+        session._place_search_adapter = BlockingPlaceSearch()
+        first = await session.process_message(
+            "请规划 8 人客户午餐，选云南菜；地点在北京市海淀区中关村附近，12 点半，人均 200 元以内，没有忌口。",
+            action="start",
+        )
+        assert first["status"] == "tool_running"
+        for _ in range(100):
+            if search_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert search_started.is_set()
+
+        patch_started = time.perf_counter()
+        revised = await asyncio.wait_for(
+            session.process_message("把时间修改到晚上吧。"),
+            timeout=1,
+        )
+        patch_latency_ms = (time.perf_counter() - patch_started) * 1000
+        assert patch_latency_ms < 1000
+        assert revised["snapshot"]["task"]["current_plan_version"] == 2
+        assert "已把时间调整到晚上，其他条件保持不变" in revised["snapshot"]["conversation"][-1]["text"]
+        assert any(
+            event["event_name"] == "TOOL_RESULT_MARKED_STALE"
+            for event in revised["snapshot"]["timeline"]
+        )
+
+        release_search.set()
+        await _wait_for_lifecycle(session, "PLANNING")
+
+    asyncio.run(scenario())
+
+
+def test_reset_cancels_tracked_background_search_without_late_state_write() -> None:
+    async def scenario() -> None:
+        session = WorkbenchSession(
+            session_id="test_background_search_reset",
+            config=WorkbenchRuntimeConfig(
+                provider_mode="codex_cli_local",
+                allow_local_codex_cli=False,
+            ),
+        )
+        session._role_adapter._provider_mode = "fake"
+        search_started = threading.Event()
+        release_search = threading.Event()
+
+        class BlockingPlaceSearch:
+            def search(self, *, query: str) -> PlaceSearchEvidence:
+                search_started.set()
+                release_search.wait(timeout=5)
+                return PlaceSearchEvidence(query=query, provider="synthetic", results=())
+
+        session._place_search_adapter = BlockingPlaceSearch()
+        await session.process_message(
+            "请规划 8 人客户午餐，选云南菜；地点在中关村附近，12 点半，人均 200 元以内，没有忌口。",
+            action="start",
+        )
+        for _ in range(100):
+            if search_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert search_started.is_set()
+
+        reset_snapshot = await asyncio.wait_for(session.reset(), timeout=1)
+        assert reset_snapshot["task"] is None
+        release_search.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert (await session.snapshot())["task"] is None
+
+    asyncio.run(scenario())
+
+
+def test_background_search_exception_becomes_partial_plan_and_is_consumed() -> None:
+    async def scenario() -> None:
+        session = WorkbenchSession(
+            session_id="test_background_search_exception",
+            config=WorkbenchRuntimeConfig(
+                provider_mode="codex_cli_local",
+                allow_local_codex_cli=False,
+            ),
+        )
+        session._role_adapter._provider_mode = "fake"
+
+        class FailingPlaceSearch:
+            def search(self, *, query: str) -> PlaceSearchEvidence:
+                raise RuntimeError("synthetic sensitive provider body")
+
+        session._place_search_adapter = FailingPlaceSearch()
+        result = await session.process_message(
+            "请规划 8 人客户午餐，选云南菜；地点在中关村附近，12 点半，人均 200 元以内，没有忌口。",
+            action="start",
+        )
+        assert result["status"] == "tool_running"
+        snapshot = await _wait_for_lifecycle(session, "PLANNING")
+        await asyncio.sleep(0)
+        assert session._background_failures == ["RuntimeError"]
+        assert not session._background_tasks
+        assert "synthetic sensitive provider body" not in json.dumps(snapshot, ensure_ascii=False)
+        assert "没有返回可引用候选" in snapshot["conversation"][-1]["text"]
+        assert "provider_unavailable" in snapshot["conversation"][-1]["text"]
 
     asyncio.run(scenario())
 
@@ -741,10 +1001,19 @@ def test_completed_plan_recap_is_safe_and_does_not_become_active_task_patch() ->
             "请规划 8 人客户晚餐，选云南菜；地点在北京市海淀区中关村附近，晚上 18 点半，人均 200 元以内，没有忌口。",
             action="start",
         )
-        assert first["snapshot"]["task"]["lifecycle"] == "PLANNING"
+        assert first["status"] == "tool_running"
+        await _wait_for_lifecycle(session, "PLANNING")
+        planned = await _wait_for_planner(session)
+        trace_cursor_before_commit = len(planned["provider_trace"])
         committed = await session.process_message("信息够了，请输出最终规划。")
         assert committed["status"] == "completed"
         assert committed["snapshot"]["task"]["lifecycle"] == "COMPLETED"
+        commit_roles = [
+            item["role"]
+            for item in committed["snapshot"]["provider_trace"][trace_cursor_before_commit:]
+            if item.get("role")
+        ]
+        assert commit_roles == ["REVIEWER"]
         final = await session.process_message("信息够了，请输出最终规划。")
 
         assert final["status"] == "completed_plan_recap"
@@ -787,18 +1056,22 @@ def test_revision_after_auto_published_plan_advances_same_task_version() -> None
             action="start",
         )
         original_task_id = original["snapshot"]["task"]["task_id"]
+        await _wait_for_lifecycle(session, "PLANNING")
         revised = await session.process_message("把时间修改到晚上吧。")
+        revised_reply = revised["snapshot"]["conversation"][-1]["text"]
 
-        assert revised["status"] == "current_plan_ready"
+        assert revised["status"] == "tool_running"
         assert revised["snapshot"]["task"]["task_id"] == original_task_id
         assert revised["snapshot"]["task"]["current_plan_version"] == 2
-        assert revised["snapshot"]["task"]["lifecycle"] == "PLANNING"
+        assert revised["snapshot"]["task"]["lifecycle"] == "EXECUTING"
         assert any(
             event["event_name"] == "PLAN_VERSION_ADVANCED"
             for event in revised["snapshot"]["timeline"]
         )
-        assert "当前可修改方案" in revised["snapshot"]["conversation"][-1]["text"]
-        assert "把时间修改到晚上" in revised["snapshot"]["conversation"][-1]["text"]
+        assert "正在" in revised_reply
+        ready_snapshot = await _wait_for_lifecycle(session, "PLANNING")
+        assert ready_snapshot["task"]["current_plan_version"] == 2
+        assert "当前可修改方案" in ready_snapshot["conversation"][-1]["text"]
 
     asyncio.run(scenario())
 
@@ -833,13 +1106,13 @@ def test_workbench_displays_validated_codex_realization_for_clarification_and_pr
         missing = await session.process_message("请帮忙规划一个接待午饭，选云南菜。", action="start")
         assert missing["status"] == "waiting_for_slot"
         assert missing["snapshot"]["conversation"][-1]["text"] == (
-            "继续规划前，请补充位置范围、参与人数。"
+            "请补充位置范围、参与人数。"
         )
 
         ready = await session.process_message("地点在北京中关村附近，明天中午 12 点，6人，人均200以内，没有忌口。")
         assert ready["status"] == "tool_running"
         assert ready["snapshot"]["conversation"][-1]["text"] == (
-            "Planner 提出了经过校验的只读工具候选 webSearch；Tool Executor 已按当前 plan 授权并启动。"
+            "已保留全部已确认条件；Python 已确定性编译并校验只读查询，正在筛选地点候选。"
         )
 
     asyncio.run(scenario())

@@ -864,6 +864,7 @@ async def _run_codex_cli_async(
         if config.reasoning_effort:
             command.extend(("-c", f"model_reasoning_effort={config.reasoning_effort}"))
 
+        subprocess_started = time.perf_counter()
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=tempfile.gettempdir(),
@@ -871,6 +872,18 @@ async def _run_codex_cli_async(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        if on_provider_event is not None:
+            await on_provider_event(
+                {
+                    "kind": "subprocess_startup",
+                    "status": "completed",
+                    "latency_ms": max(
+                        0,
+                        int((time.perf_counter() - subprocess_started) * 1000),
+                    ),
+                    "orchestration_role": "provider",
+                }
+            )
         try:
             stdout, stderr = await asyncio.wait_for(
                 _stream_codex_process(

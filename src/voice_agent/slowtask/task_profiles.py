@@ -38,6 +38,11 @@ class TaskProfileRegistry:
     def profiles(self) -> tuple[TaskProfile, ...]:
         return tuple(self._profiles[name] for name in sorted(self._profiles))
 
+    def has_deterministic_extractor(self, profile_id: str) -> bool:
+        return profile_id in {
+            "customer_reception", "research_report", "code_refactor", "team_event",
+        }
+
 
 def builtin_task_profile_registry() -> TaskProfileRegistry:
     return TaskProfileRegistry(
@@ -171,7 +176,20 @@ def _extract_customer_reception(text: str) -> dict[str, tuple[Any, SlotState]]:
     elif any(term in text for term in ("下周吧", "下周左右", "下周都行")):
         values["time_window"] = ("下周（日期和时段不明确）", SlotState.AMBIGUOUS)
     elif any(term in text for term in ("今天", "明天", "后天", "上午", "下午", "中午", "晚上", "午饭", "午餐", "晚饭", "晚餐", "周一", "周二", "周三", "周四", "周五", "周六", "周日")):
-        values["time_window"] = (" ".join(text.split())[:120], SlotState.RESOLVED)
+        # A bounded deterministic patch such as “改到晚上” should replace
+        # only the time fact, not store the surrounding conversational text.
+        date_part = next(
+            (term for term in ("今天", "明天", "后天", "周一", "周二", "周三", "周四", "周五", "周六", "周日") if term in text),
+            None,
+        )
+        period_part = next(
+            (term for term in ("上午", "中午", "下午", "晚上", "午饭", "午餐", "晚饭", "晚餐") if term in text),
+            None,
+        )
+        values["time_window"] = (
+            " ".join(item for item in (date_part, period_part) if item),
+            SlotState.RESOLVED,
+        )
     party = re.search(r"(\d+|[一二三四五六七八九十两]+)\s*(?:个|位)?人", text)
     if party:
         values["party_size"] = (_chinese_or_digit_number(party.group(1)), SlotState.RESOLVED)
@@ -181,7 +199,9 @@ def _extract_customer_reception(text: str) -> dict[str, tuple[Any, SlotState]]:
     if any(term in text for term in ("无忌口", "没有忌口", "没忌口", "没有饮食限制")):
         values["dietary_constraints"] = ([], SlotState.RESOLVED)
     elif "不吃辣" in text:
-        values["dietary_constraints"] = (["不吃辣"], SlotState.RESOLVED)
+        count = re.search(r"([一二三四五六七八九十两\d]+)\s*(?:个|位)?(?:人)?不吃辣", text)
+        constraint = f"{count.group(1)}位不吃辣" if count else "不吃辣"
+        values["dietary_constraints"] = ([constraint], SlotState.RESOLVED)
     if "云南菜" in text or "滇菜" in text:
         values["cuisine_preference"] = ("云南菜", SlotState.RESOLVED)
     return values

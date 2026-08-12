@@ -7,7 +7,12 @@ from dataclasses import dataclass, field, replace
 import time
 from typing import Any, Callable
 
-from voice_agent.adapters.codex_roles import CodexRole, CodexRoleAdapter, RoleInvocationResult
+from voice_agent.adapters.codex_roles import (
+    ROLE_CONTRACT_VERSION,
+    CodexRole,
+    CodexRoleAdapter,
+    RoleInvocationResult,
+)
 from voice_agent.slowtask.requirement_model import (
     RequirementSourceRoute,
     RequirementStage,
@@ -27,8 +32,9 @@ class RoleOrchestrationError(RuntimeError):
 @dataclass(frozen=True)
 class RoleRunBudget:
     max_invocations: int
-    total_timeout_seconds: int = 180
+    total_timeout_seconds: int = 60
     max_planner_repairs: int = 1
+    max_repair_invocations: int = 2
 
 
 @dataclass
@@ -37,10 +43,17 @@ class RoleRun:
     started_at: float = field(default_factory=time.monotonic)
     invocations: list[RoleInvocationResult] = field(default_factory=list)
     planner_repairs: int = 0
+    repair_invocations: list[RoleInvocationResult] = field(default_factory=list)
 
     def require_capacity(self, role: CodexRole) -> None:
         if len(self.invocations) >= self.budget.max_invocations:
             raise RoleOrchestrationError(f"role invocation budget exhausted before {role.value}")
+        if time.monotonic() - self.started_at > self.budget.total_timeout_seconds:
+            raise RoleOrchestrationError("total role orchestration timeout exceeded")
+
+    def require_repair_capacity(self, role: CodexRole) -> None:
+        if len(self.repair_invocations) >= self.budget.max_repair_invocations:
+            raise RoleOrchestrationError(f"repair invocation budget exhausted before {role.value}")
         if time.monotonic() - self.started_at > self.budget.total_timeout_seconds:
             raise RoleOrchestrationError("total role orchestration timeout exceeded")
 
@@ -168,32 +181,90 @@ class SlowLLMRoleOrchestrator:
             raise RoleOrchestrationError("Clarifier may only receive selected USER requirements")
         return await self._invoke(run=run, role=CodexRole.CLARIFIER, invocation=invocation)
 
+    async def plan_only(
+        self,
+        *,
+        run: RoleRun,
+        invocation: Mapping[str, Any],
+    ) -> RoleInvocationResult:
+        return await self._invoke(run=run, role=CodexRole.PLANNER, invocation=invocation)
+
+    async def review_existing_plan(
+        self,
+        *,
+        run: RoleRun,
+        invocation: Mapping[str, Any],
+        planner: RoleInvocationResult,
+    ) -> PlanReviewResult:
+        reviewer_invocation = dict(invocation)
+        reviewer_context = dict(invocation.get("role_context", {}))
+        reviewer_context["plan_proposal"] = dict(planner.proposal["payload"])
+        reviewer_invocation["role_context"] = reviewer_context
+        reviewer = await self._invoke(
+            run=run,
+            role=CodexRole.REVIEWER,
+            invocation=reviewer_invocation,
+        )
+        verdict = str(reviewer.proposal["payload"].get("verdict", "BLOCK"))
+        return PlanReviewResult(
+            planner=planner,
+            reviewer=reviewer,
+            accepted=verdict == "PASS",
+        )
+
     async def plan_and_review(self, *, run: RoleRun, invocation: Mapping[str, Any]) -> PlanReviewResult:
-        planner = await self._invoke(run=run, role=CodexRole.PLANNER, invocation=invocation)
+        planner = await self.plan_only(run=run, invocation=invocation)
         reviewer_invocation = dict(invocation)
         reviewer_context = dict(invocation.get("role_context", {}))
         reviewer_context["plan_proposal"] = dict(planner.proposal["payload"])
         reviewer_invocation["role_context"] = reviewer_context
         reviewer = await self._invoke(run=run, role=CodexRole.REVIEWER, invocation=reviewer_invocation)
         verdict = str(reviewer.proposal["payload"].get("verdict", "BLOCK"))
-        if verdict == "REVISE" and run.planner_repairs < run.budget.max_planner_repairs and len(run.invocations) + 2 <= run.budget.max_invocations:
+        if verdict == "REVISE" and run.planner_repairs < run.budget.max_planner_repairs:
             run.planner_repairs += 1
             repair_context = dict(reviewer_context)
             repair_context["review_feedback"] = dict(reviewer.proposal["payload"])
             repair_invocation = dict(invocation)
             repair_invocation["role_context"] = repair_context
-            planner = await self._invoke(run=run, role=CodexRole.PLANNER, invocation=repair_invocation)
+            planner = await self._invoke(
+                run=run,
+                role=CodexRole.PLANNER,
+                invocation=repair_invocation,
+                repair=True,
+            )
             reviewer_context["plan_proposal"] = dict(planner.proposal["payload"])
             reviewer_invocation["role_context"] = reviewer_context
-            reviewer = await self._invoke(run=run, role=CodexRole.REVIEWER, invocation=reviewer_invocation)
+            reviewer = await self._invoke(
+                run=run,
+                role=CodexRole.REVIEWER,
+                invocation=reviewer_invocation,
+                repair=True,
+            )
             verdict = str(reviewer.proposal["payload"].get("verdict", "BLOCK"))
         return PlanReviewResult(planner=planner, reviewer=reviewer, accepted=verdict == "PASS")
 
-    async def _invoke(self, *, run: RoleRun, role: CodexRole, invocation: Mapping[str, Any], cacheable: bool = False) -> RoleInvocationResult:
-        run.require_capacity(role)
+    async def _invoke(
+        self,
+        *,
+        run: RoleRun,
+        role: CodexRole,
+        invocation: Mapping[str, Any],
+        cacheable: bool = False,
+        repair: bool = False,
+    ) -> RoleInvocationResult:
+        if repair:
+            run.require_repair_capacity(role)
+        else:
+            run.require_capacity(role)
         binding = invocation["task_binding"]
         context_hash = str(invocation.get("context_hash", "uncached"))
-        key = (str(binding["task_id"]), int(binding["plan_version"]), context_hash, role.value, "v1")
+        key = (
+            str(binding["task_id"]),
+            int(binding["plan_version"]),
+            context_hash,
+            role.value,
+            ROLE_CONTRACT_VERSION,
+        )
         if cacheable and key in self._cache:
             return self._cache[key]
         result = await self._adapter.invoke(
@@ -207,7 +278,10 @@ class SlowLLMRoleOrchestrator:
             created_monotonic_ms=int(invocation["created_monotonic_ms"]),
             created_wall_clock_ms=int(invocation["created_wall_clock_ms"]),
         )
-        run.invocations.append(result)
+        if repair:
+            run.repair_invocations.append(result)
+        else:
+            run.invocations.append(result)
         if cacheable:
             self._cache[key] = result
         return result
